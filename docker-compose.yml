@@ -1,0 +1,98 @@
+networks:
+  ria:
+    driver: bridge
+
+volumes:
+  resumes:
+
+services:
+  db:
+    image: postgres:17-alpine
+    container_name: ria.db
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_USER: ${DB_USERNAME}
+      POSTGRES_DB: ${DB_DATABASE}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 1s
+      timeout: 5s
+      retries: 10
+    ports:
+      - 5430:5432
+    volumes:
+      - ./db_data:/var/lib/postgresql/data
+      - ./docker/scripts/postgres:/docker-entrypoint-initdb.d
+    networks:
+      - ria
+
+  db_client:
+    image: dpage/pgadmin4
+    container_name: ria.db_client
+    ports:
+      - 5050:80
+    environment:
+      PGADMIN_DEFAULT_EMAIL: user@example.com
+      PGADMIN_DEFAULT_PASSWORD: test
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ria
+
+  queue:
+    image: redis:8-alpine
+    container_name: ria.queue
+    ports:
+      - 6379:6379
+    networks:
+      - ria
+
+  base:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: dev
+      args:
+        - UID=${UID:-1000}
+        - GID=${GID:-1000}
+    image: ria/base
+    profiles: ["build-only"]
+
+  api:
+    image: ria/base
+    container_name: ria.api
+    env_file:
+      - .env
+    depends_on:
+      - db
+      - queue
+    volumes:
+      - ./src:/opt/app/src
+      - ./pyproject.toml:/opt/app/pyproject.toml
+      - ./poetry.lock:/opt/app/poetry.lock
+      - resumes:/opt/app/resumes
+    ports:
+      - 8000:8000
+    command: poetry run uvicorn src.main:app --host 0.0.0.0 --port 8000 --reload
+    networks:
+      - ria
+
+  worker:
+    image: ria/base
+    container_name: ria.worker
+    depends_on:
+      - queue
+    env_file:
+     - .env
+    volumes:
+      - ./src:/opt/app/src
+      - ./pyproject.toml:/opt/app/pyproject.toml
+      - ./poetry.lock:/opt/app/poetry.lock
+      - resumes:/opt/app/resumes
+    command: poetry run rq worker default --verbose
+    networks:
+      - ria
