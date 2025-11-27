@@ -7,6 +7,9 @@ load_dotenv(verbose=True)
 
 class Settings:
     app_name = os.getenv("APP_NAME", "RIA")
+    app_env = os.getenv("APP_ENV", "development")
+
+    log_level = os.getenv("LOG_LEVEL", "INFO")
 
     db_dialect = os.getenv("DB_DIALECT", "postgresql")
     db_host = os.getenv("DB_HOST", "localhost")

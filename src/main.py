@@ -1,11 +1,17 @@
+import time
+import uuid
+
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, status
+from fastapi import Depends, FastAPI, Request, status
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import JSONResponse
 
 from .api import router
 from .database import db, init_db
 from .deps import get_db_connection
+from .logger import REQUEST_ID_CTX, logger
 from .settings import settings
 
 
@@ -16,7 +22,10 @@ async def lifespan(app: FastAPI):
 
     app.state.resume_upload_dir = resume_upload_dir
     await db.open_pool()
+    
+    logger.info("Initializing Database...")
     await init_db()
+    logger.info("Database initialization completed")
 
     yield
 
@@ -28,18 +37,54 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+app.add_middleware(GZipMiddleware, minimum_size=1000, compresslevel=5)
+
+
+@app.middleware("http")
+async def add_request_id(request: Request, call_next):
+    req_id = request.headers.get("x-request-id") or str(uuid.uuid4())
+    REQUEST_ID_CTX.set(req_id)
+
+    start = time.perf_counter()
+
+    response = await call_next(request)
+    
+    duration_ms = (time.perf_counter() - start) * 1000
+
+    logger.info(
+        "HTTP Request",
+        extra={
+            "request_id": req_id,
+            "method": request.method,
+            "path": request.url.path,
+            "status_code": response.status_code,
+            "duration_ms": duration_ms,
+        }
+    )
+    response.headers["X-Request-ID"] = req_id
+    return response
+    
 app.include_router(router=router)
 
 @app.get("/health", status_code=status.HTTP_200_OK)
 async def health(db_conn=Depends(get_db_connection)):
-    try:
-        await db_conn.execute("SELECT 1")
-        db_status = "healthy"
-    except Exception as e:
-        db_status = f"unhealthy: {str(e)}"
+    await db_conn.execute("SELECT 1")
+    db_status = "healthy"
     
     return {
         "status": "healthy",
         "database": db_status,
         "resume_dir": str(app.state.resume_upload_dir.exists())
     }
+
+
+@app.exception_handler(Exception)
+async def generic_exception_handler(request: Request, e: Exception):
+    logger.critical("Unhandled exception", extra={
+        "request": REQUEST_ID_CTX,
+        "exception": e,
+    })
+    return JSONResponse(
+        content={"message": "Something went wrong"},
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+    )
