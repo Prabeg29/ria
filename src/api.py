@@ -18,6 +18,7 @@ from rq.decorators import job
 
 from .database import db
 from .deps import get_resume_upload_dir, get_db_connection
+from .logger import logger
 from .models import Resume
 from .prompts import EXTRACT_RESUME_PROMPT
 from .settings import settings
@@ -50,7 +51,7 @@ async def process_and_save_resume(resume_id: uuid.UUID) -> None:
         if resume is None:
             raise Exception(f"No resume found with ID {resume_id}.")
 
-        print(f"Starting resume processing for {resume.filename} with ID {resume_id}.")
+        logger.info(f"Starting resume processing for {resume.filename} with ID {resume_id}.")
         response = gemini_client.models.generate_content(
             model=settings.gemini_model,
             contents=EXTRACT_RESUME_PROMPT.format(text=resume.raw_text),
@@ -58,6 +59,11 @@ async def process_and_save_resume(resume_id: uuid.UUID) -> None:
 
         if response.text is None:
             raise Exception(f"No response found for resume with ID {resume_id}.")
+
+        logger.info(f"Received response from Gemini", extra={
+            "resume_id": resume_id,
+            "resume_filename": resume.filename,
+        })
 
         clean = response.text.strip().strip("`").replace("```json", "").replace("```", "")
 
@@ -74,9 +80,12 @@ async def process_and_save_resume(resume_id: uuid.UUID) -> None:
             )
             await aconn.commit()
 
-        print(f"Updated resume {resume.filename} (ID: {resume_id}) with parsed data.")
+        logger.info(f"Updated resume with parsed data", extra={
+            "resume_id": resume_id,
+            "resume_filename": resume.filename,
+        })
     except Exception as e:
-        print(f"Error processing resume with (ID: {resume_id}): {e}")
+        logger.error(f"Error processing resume with (ID: {resume_id}): {e}")
     finally:
         await db.close_pool()
     
@@ -91,7 +100,10 @@ s3_client = boto3.client(
 
 @job("default", connection=Redis(host=settings.redis_host))
 async def upload_resume_to_s3(resume_id: uuid.UUID, file_path: Path) -> None:
-    print(f"Starting S3 upload for {file_path.name} with ID {resume_id}.")
+    logger.info("Starting S3 upload", extra={
+        "filename": file_path.name,
+        "resume_id": resume_id,
+    })
     await db.open_pool()
     try:
         s3_object_name = f"{resume_id}_{file_path.name}"
@@ -101,6 +113,11 @@ async def upload_resume_to_s3(resume_id: uuid.UUID, file_path: Path) -> None:
             s3_object_name,
         )
         s3_url = f"https://{settings.aws_bucket}.s3.{settings.aws_region}.amazonaws.com/{s3_object_name}"
+
+        logger.info("Uploaded to S3", extra={
+            "filename": file_path.name,
+            "resume_id": resume_id,
+        })
 
         async with db.connection() as aconn:
             await aconn.execute("""
@@ -113,12 +130,13 @@ async def upload_resume_to_s3(resume_id: uuid.UUID, file_path: Path) -> None:
             )
             await aconn.commit()
 
-        print(f"[S3] Uploaded {file_path.name} (ID: {resume_id}) to {s3_url}")
             
         file_path.unlink()
-        print(f"[S3] Deleted local file after S3 upload: {file_path}")
+        logger.info("[S3 Resume Upload]: Deleted local file after S3 upload", extra={
+            "file_path": file_path
+        })
     except Exception as e:
-        print(f"[S3] Failed to upload {file_path.name} (ID: {resume_id}) to S3: {e}")
+        logger.error("[S3 Resume Upload]: Failed to upload resume to S3", e)
     finally:
         await db.close_pool()
 
@@ -187,6 +205,10 @@ async def upload_resume(
         while content := await file.read(CHUNK_SIZE):
             await out_file.write(content)
 
+    logger.info(f"[POST: /resumes/upload]: File saved to {resume_upload_dir}", extra={
+        "uploaded_resume": timestamped_name,
+    })
+
     resume = Resume(
         filename=file.filename,
         raw_text=raw_text,
@@ -210,7 +232,17 @@ async def upload_resume(
         ),
     )
 
+    logger.info(f"[POST: /resumes/upload]: Resume saved to db", extra={
+        "resume_id": resume.id,
+    })
+    
+    logger.info(f"[POST: /resumes/upload]: Resume dispatched for LLM extraction", extra={
+        "resume_id": resume.id,
+    })
     process_and_save_resume.delay(resume.id)  # type: ignore
-    upload_resume_to_s3.delay(resume.id, destination_path,)  # type: ignore
+    # logger.info(f"[POST: /resumes/upload]: Resume dispatched for S3 uploads", extra={
+    #     "resume_id": resume.id,
+    # })
+    # upload_resume_to_s3.delay(resume.id, destination_path,)  # type: ignore
 
     return {"message": "Resume uploaded and processing initiated", "resume_id": str(resume.id)}

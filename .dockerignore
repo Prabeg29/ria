@@ -1,0 +1,14 @@
+.dockerignore
+.env
+.env.example
+.git
+.gitignore
+Dockerfile
+README.md
+db_data/
+.venv/
+docker/
+.python-version
+docker-compose.yml
+README.md
+poetry.toml
