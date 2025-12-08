@@ -2,6 +2,7 @@ import json
 import uuid
 
 from datetime import datetime
+from dataclasses import dataclass
 from pathlib import Path
 
 import aiofiles
@@ -10,6 +11,7 @@ import pymupdf
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, status
 from google import genai
+from playwright.async_api import async_playwright
 from psycopg import sql
 from psycopg.rows import class_row
 from psycopg.types.json import Json
@@ -18,9 +20,9 @@ from rq.decorators import job
 
 from .database import db
 from .deps import get_resume_upload_dir, get_db_connection
-from .logger import logger
+from .logger import REQUEST_ID_CTX, logger
 from .models import Resume
-from .prompts import EXTRACT_RESUME_PROMPT
+from .prompts import EXTRACT_RESUME_PROMPT, ANALYZE_RESUME_AGAINST_JOB_PROMPT
 from .settings import settings
 from .text_processor import TextPreprocessor
 
@@ -29,7 +31,8 @@ gemini_client = genai.Client(api_key=settings.gemini_api_key)
 
 
 @job("default", connection=Redis(host=settings.redis_host))
-async def process_and_save_resume(resume_id: uuid.UUID) -> None:
+async def process_and_save_resume(request_id: str, resume_id: uuid.UUID) -> None:
+    REQUEST_ID_CTX.set(request_id)
     await db.open_pool()
     try:
         async with db.connection() as aconn:
@@ -99,7 +102,8 @@ s3_client = boto3.client(
 
 
 @job("default", connection=Redis(host=settings.redis_host))
-async def upload_resume_to_s3(resume_id: uuid.UUID, file_path: Path) -> None:
+async def upload_resume_to_s3(request_id:str, resume_id: uuid.UUID, file_path: Path) -> None:
+    REQUEST_ID_CTX.set(request_id)
     logger.info("Starting S3 upload", extra={
         "filename": file_path.name,
         "resume_id": resume_id,
@@ -239,10 +243,64 @@ async def upload_resume(
     logger.info(f"[POST: /resumes/upload]: Resume dispatched for LLM extraction", extra={
         "resume_id": resume.id,
     })
-    process_and_save_resume.delay(resume.id)  # type: ignore
-    # logger.info(f"[POST: /resumes/upload]: Resume dispatched for S3 uploads", extra={
-    #     "resume_id": resume.id,
-    # })
-    # upload_resume_to_s3.delay(resume.id, destination_path,)  # type: ignore
+    process_and_save_resume.delay(REQUEST_ID_CTX.get(), resume.id)  # type: ignore
+    logger.info(f"[POST: /resumes/upload]: Resume dispatched for S3 uploads", extra={
+        "resume_id": resume.id,
+    })
+    upload_resume_to_s3.delay(REQUEST_ID_CTX.get(), resume.id, destination_path,)  # type: ignore
 
     return {"message": "Resume uploaded and processing initiated", "resume_id": str(resume.id)}
+
+@dataclass
+class ResumeAnalyzeSchema:
+    job_url: str
+    resume_id: str
+
+
+@router.post("/resumes/analyze")
+async def analyze_resume(
+    payload: ResumeAnalyzeSchema,
+    db_con=Depends(get_db_connection),
+):
+    async with db_con.cursor(row_factory=class_row(Resume)) as cur:
+        await cur.execute("""
+                SELECT
+                    resumes.id,
+                    resumes.raw_text,
+                FROM resumes
+                WHERE resumes.id = %s
+            """,
+            (payload.resume_id,),
+            )
+            
+        resume = await cur.fetchone()
+
+    if resume is None:
+        raise Exception(f"No resume found with ID {payload.resume_id}.")
+
+    async with async_playwright() as p:
+        firefox = p.firefox
+        browser = await firefox.launch(headless=True)
+        page = await browser.new_page()
+
+        await page.goto(payload.job_url, wait_until="domcontentloaded",)
+
+        job = {}
+
+        job["title"] = await page.locator('h1[data-automation="job-detail-title"]').inner_text()
+        job["company"] = await page.locator('span[data-automation="advertiser-name"]').inner_text()
+        job["location"] = await page.locator('span[data-automation="job-detail-location"]').inner_text()
+        job["details"] = await page.locator('div[data-automation="jobAdDetails"]').all_text_contents()
+
+        await browser.close()
+    
+    analysis_response = gemini_client.models.generate_content(
+        model=settings.gemini_model,
+        contents=ANALYZE_RESUME_AGAINST_JOB_PROMPT.format(
+            resume_raw_text=resume.raw_text,
+            job=job,
+        ),
+    )
+    analysis_text = analysis_response.text
+
+    print(analysis_text)
