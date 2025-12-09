@@ -19,7 +19,8 @@ from redis import Redis
 from rq.decorators import job
 
 from .database import db
-from .deps import get_resume_upload_dir, get_db_connection
+from .deps import get_resume_upload_dir, get_db_connection, get_scraper_registry
+from .job_scraper import ScraperRegistry
 from .logger import REQUEST_ID_CTX, logger
 from .models import Resume
 from .prompts import EXTRACT_RESUME_PROMPT, ANALYZE_RESUME_AGAINST_JOB_PROMPT
@@ -261,6 +262,7 @@ class ResumeAnalyzeSchema:
 async def analyze_resume(
     payload: ResumeAnalyzeSchema,
     db_con=Depends(get_db_connection),
+    scraper_registry: ScraperRegistry = Depends(get_scraper_registry)
 ):
     async with db_con.cursor(row_factory=class_row(Resume)) as cur:
         await cur.execute("""
@@ -283,14 +285,9 @@ async def analyze_resume(
         browser = await firefox.launch(headless=True)
         page = await browser.new_page()
 
-        await page.goto(payload.job_url, wait_until="domcontentloaded",)
+        job_scraper = scraper_registry.resolve(payload.job_url)
 
-        job = {}
-
-        job["title"] = await page.locator('h1[data-automation="job-detail-title"]').inner_text()
-        job["company"] = await page.locator('span[data-automation="advertiser-name"]').inner_text()
-        job["location"] = await page.locator('span[data-automation="job-detail-location"]').inner_text()
-        job["details"] = await page.locator('div[data-automation="jobAdDetails"]').all_text_contents()
+        job = await job_scraper.extract(page)
 
         await browser.close()
     

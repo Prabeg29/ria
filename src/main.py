@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse
 from .api import router
 from .database import db, init_db
 from .deps import get_db_connection
+from .job_scraper import LinkedinJobScraper, ScraperRegistry, SeekJobScraper
 from .logger import REQUEST_ID_CTX, logger
 from .settings import settings
 
@@ -26,6 +27,11 @@ async def lifespan(app: FastAPI):
     logger.info("Initializing Database...")
     await init_db()
     logger.info("Database initialization completed")
+
+    ScraperRegistry.register("", LinkedinJobScraper)
+    ScraperRegistry.register("", SeekJobScraper)
+
+    app.state.scraper_registry = ScraperRegistry
 
     yield
 
