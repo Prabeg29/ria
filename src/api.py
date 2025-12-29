@@ -10,6 +10,7 @@ import boto3
 import pymupdf
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, status
+from fastapi.responses import StreamingResponse
 from google import genai
 from playwright.async_api import async_playwright
 from psycopg import sql
@@ -252,6 +253,50 @@ async def upload_resume(
 
     return {"message": "Resume uploaded and processing initiated", "resume_id": str(resume.id)}
 
+
+def build_sse_event(data: dict, event_type: str = "message") -> str:
+    return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
+
+
+async def analysis_generator(
+    resume_text: str,
+    job_url: str,
+    scraper_registry: ScraperRegistry
+):
+    yield build_sse_event({"status": "scraping", "message": "Accessing job URL..."}, event_type="status")
+        
+    async with async_playwright() as p:
+        browser = await p.firefox.connect(
+            ws_endpoint="ws://browserless:3000/firefox/playwright?headless=true"
+        )
+        page = await browser.new_page()
+
+        await page.goto(
+            url=job_url,
+            wait_until="domcontentloaded",
+        )
+    
+        job_scraper = scraper_registry.resolve(job_url)
+
+        job_data = await job_scraper.extract(page)
+        await browser.close()
+
+
+    yield build_sse_event({"status": "analyzing", "message": "Reasoning with AI..."}, event_type="status")
+
+    async for chunk in await gemini_client.aio.models.generate_content_stream(
+        model=settings.gemini_model,
+        contents=ANALYZE_RESUME_AGAINST_JOB_PROMPT.format(
+            resume_raw_text=resume_text,
+            job=job_data
+        )
+    ):
+        if chunk.text:
+            yield build_sse_event({"text": chunk.text}, event_type="delta")
+
+    yield build_sse_event({"status": "complete"}, event_type="done")
+
+
 @dataclass
 class ResumeAnalyzeSchema:
     job_url: str
@@ -268,7 +313,7 @@ async def analyze_resume(
         await cur.execute("""
                 SELECT
                     resumes.id,
-                    resumes.raw_text,
+                    resumes.raw_text
                 FROM resumes
                 WHERE resumes.id = %s
             """,
@@ -279,25 +324,12 @@ async def analyze_resume(
 
     if resume is None:
         raise Exception(f"No resume found with ID {payload.resume_id}.")
-
-    async with async_playwright() as p:
-        firefox = p.firefox
-        browser = await firefox.launch(headless=True)
-        page = await browser.new_page()
-
-        job_scraper = scraper_registry.resolve(payload.job_url)
-
-        job = await job_scraper.extract(page)
-
-        await browser.close()
     
-    analysis_response = gemini_client.models.generate_content(
-        model=settings.gemini_model,
-        contents=ANALYZE_RESUME_AGAINST_JOB_PROMPT.format(
-            resume_raw_text=resume.raw_text,
-            job=job,
+    return StreamingResponse(
+        analysis_generator(
+            resume_text=resume.raw_text,
+            job_url=payload.job_url,
+            scraper_registry=scraper_registry
         ),
+        media_type="text/event-stream",
     )
-    analysis_text = analysis_response.text
-
-    print(analysis_text)
