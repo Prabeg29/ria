@@ -96,3 +96,13 @@ services:
     command: poetry run rq worker default --verbose
     networks:
       - ria
+
+  browserless:
+    image: ghcr.io/browserless/firefox
+    container_name: ria.browserless
+    depends_on:
+      - api
+    ports:
+      - 3000:3000
+    networks:
+      - ria
