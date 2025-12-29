@@ -61,6 +61,7 @@ Return ONLY the final JSON object. Nothing else.
 If you output backticks, markdown, or anything other than plain JSON, you FAIL the task. Do not fail.
 """
 
+
 ANALYZE_RESUME_AGAINST_JOB_PROMPT="""
 Analyze the following resume and job description. Provide a detailed analysis including:
 
