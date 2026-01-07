@@ -102,7 +102,17 @@ services:
     container_name: ria.browserless
     depends_on:
       - api
+    environment:
+      - CONCURRENT=3
+      - QUEUED=3
+      - TIMEOUT=100000
     ports:
       - 3000:3000
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/pressure"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
     networks:
       - ria

@@ -1,5 +1,3 @@
-import asyncio
-import random
 import time
 import uuid
 
@@ -9,7 +7,6 @@ from pathlib import Path
 from fastapi import Depends, FastAPI, Request, status
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
-from playwright.async_api import async_playwright
 
 from .api import router
 from .database import db, init_db
@@ -19,69 +16,18 @@ from .logger import REQUEST_ID_CTX, logger
 from .settings import settings
 
 
-class BrowserPool:
-    def __init__(self, ws_connection: str, max_browsers: int, max_pages: int):
-        self._ws_connection = ws_connection
-        self._max_browsers = max_browsers
-        self._max_pages = max_pages
-
-        self._playwright = None
-        self._browsers = []
-
-        self._browser_lock = asyncio.Lock()
-        self._page_semaphore = asyncio.Semaphore(max_pages)
-
-    async def startup(self):
-        self._playwright = await async_playwright().start()
-
-    async def shutdown(self):
-        for browser in self._browsers:
-            await browser.close()
-
-        if self._playwright:
-            await self._playwright.stop()
-
-    @asynccontextmanager
-    async def page(self):
-        async with self._page_semaphore:
-            browser = await self._get_browser()
-            context = await browser.new_context()
-            page = await context.new_page()
-
-            try:
-                yield page
-            finally:
-                await context.close()
-    
-    async def _get_browser(self):
-        async with self._browser_lock:
-            if self._playwright is None:
-                raise RuntimeError("BrowserPool not initialized. Call startup() first.")
-            
-            if len(self._browsers) < self._max_browsers:
-                browser = await self._playwright.firefox.connect(
-                    ws_endpoint=self._ws_connection
-                )
-                self._browsers.append(browser)
-                
-                return browser
-            
-            return random.choice(self._browsers)
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     project_root = Path(__file__).resolve().parents[1]
     resume_upload_dir = project_root / "resumes"
-
     app.state.resume_upload_dir = resume_upload_dir
+   
     await db.open_pool()
-    
     logger.info("Initializing Database...")
     await init_db()
     logger.info("Database initialization completed")
 
     ScraperRegistry.register("www.seek.com.au", SeekJobScraper)
-
     app.state.scraper_registry = ScraperRegistry
 
     yield

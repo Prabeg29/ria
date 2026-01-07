@@ -20,8 +20,11 @@ from redis import Redis
 from rq.decorators import job
 
 from .database import db
-from .deps import get_resume_upload_dir, get_db_connection, get_scraper_registry
-from .job_scraper import ScraperRegistry
+from .deps import (
+    get_resume_upload_dir,
+    get_db_connection,
+    get_scraper_registry,
+)
 from .logger import REQUEST_ID_CTX, logger
 from .models import Resume
 from .prompts import EXTRACT_RESUME_PROMPT, ANALYZE_RESUME_AGAINST_JOB_PROMPT
@@ -30,9 +33,10 @@ from .text_processor import TextPreprocessor
 
 
 gemini_client = genai.Client(api_key=settings.gemini_api_key)
+redis_conn = Redis(host=settings.redis_host, decode_responses=True)
 
 
-@job("default", connection=Redis(host=settings.redis_host))
+@job("default", connection=redis_conn)
 async def process_and_save_resume(request_id: str, resume_id: uuid.UUID) -> None:
     REQUEST_ID_CTX.set(request_id)
     await db.open_pool()
@@ -165,7 +169,7 @@ async def upload_resume(
 ):
     if not file.filename or not file.filename.strip():
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="Filename is required",
         )
 
@@ -195,7 +199,7 @@ async def upload_resume(
             .get_text()
     )
 
-    if not text:
+    if not raw_text:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="File is empty.",
@@ -258,32 +262,50 @@ def build_sse_event(data: dict, event_type: str = "message") -> str:
     return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
 
 
-async def analysis_generator(
+def publish(job_id: str, event_type: str, data: dict = {}):
+    redis_conn.xadd(
+        f"analysis:stream:{job_id}",
+        {
+            "type": event_type,
+            "payload": json.dumps(data)
+        }
+    )
+
+
+@job("default", connection=Redis(host=settings.redis_host))
+async def scrape_job_and_ingress_llm(
+    *,
+    request_id: str,
     resume_text: str,
     job_url: str,
-    scraper_registry: ScraperRegistry
-):
-    yield build_sse_event({"status": "scraping", "message": "Accessing job URL..."}, event_type="status")
-        
+    job_scraper,
+) -> None:
+    REQUEST_ID_CTX.set(request_id)
+
+    publish(request_id, "status", {
+        "status": "scraping",
+        "message": "Accessing job url..."
+    })
+
     async with async_playwright() as p:
         browser = await p.firefox.connect(
             ws_endpoint="ws://browserless:3000/firefox/playwright?headless=true"
         )
         page = await browser.new_page()
-
+    
+        await page.route("**/*.{png,jpg,jpeg,gif,css,woff2}", lambda route: route.abort())
         await page.goto(
             url=job_url,
             wait_until="domcontentloaded",
         )
     
-        job_scraper = scraper_registry.resolve(job_url)
-
         job_data = await job_scraper.extract(page)
-        await browser.close()
 
-
-    yield build_sse_event({"status": "analyzing", "message": "Reasoning with AI..."}, event_type="status")
-
+    publish(request_id, "status", {
+        "status": "analyzing",
+        "message": "Reasoning with AI"
+    })
+    
     async for chunk in await gemini_client.aio.models.generate_content_stream(
         model=settings.gemini_model,
         contents=ANALYZE_RESUME_AGAINST_JOB_PROMPT.format(
@@ -292,24 +314,24 @@ async def analysis_generator(
         )
     ):
         if chunk.text:
-            yield build_sse_event({"text": chunk.text}, event_type="delta")
+            publish(request_id, "delta", {"text": chunk.text})
 
-    yield build_sse_event({"status": "complete"}, event_type="done")
+    publish(request_id, "done", {"status": "complete"})
 
 
 @dataclass
 class ResumeAnalyzeSchema:
     job_url: str
-    resume_id: str
 
 
-@router.post("/resumes/analyze")
+@router.post("/resumes/{resume_id}/analyze", status_code=status.HTTP_202_ACCEPTED)
 async def analyze_resume(
+    resume_id: str,
     payload: ResumeAnalyzeSchema,
-    db_con=Depends(get_db_connection),
-    scraper_registry: ScraperRegistry = Depends(get_scraper_registry)
+    db_conn=Depends(get_db_connection),
+    scraper_registry=Depends(get_scraper_registry),
 ):
-    async with db_con.cursor(row_factory=class_row(Resume)) as cur:
+    async with db_conn.cursor(row_factory=class_row(Resume)) as cur:
         await cur.execute("""
                 SELECT
                     resumes.id,
@@ -317,19 +339,57 @@ async def analyze_resume(
                 FROM resumes
                 WHERE resumes.id = %s
             """,
-            (payload.resume_id,),
+            (resume_id,),
             )
             
         resume = await cur.fetchone()
 
     if resume is None:
-        raise Exception(f"No resume found with ID {payload.resume_id}.")
+        raise Exception(f"No resume found with ID {resume_id}.")
     
+    scrape_job_and_ingress_llm.delay( # type: ignore
+        request_id=REQUEST_ID_CTX.get(),
+        resume_text=resume.raw_text,
+        job_url=payload.job_url,
+        job_scraper=scraper_registry.resolve(payload.job_url),
+    )
+
+    return {"status": "queued", "job_id": REQUEST_ID_CTX.get()}
+
+
+async def analysis_generator(job_id: str):
+    stream_key = f"analysis:stream:{job_id}"
+    last_id = "0-0"
+
+    yield build_sse_event({"status": "listening"}, "status")
+
+    while True:
+        messages = redis_conn.xread(
+            {stream_key: last_id},
+            block=5000,
+            count=10,
+        )
+
+        if not messages:
+            continue
+
+        entries = messages[0][1][0] # type: ignore
+
+        for message_id, fields in entries:
+            last_id = message_id
+
+            event_type = fields["type"]
+            payload = json.loads(fields["payload"])
+
+            yield build_sse_event(payload, event_type)
+
+            if event_type == "done":
+                return
+
+
+@router.get("/analysis/{job_id}")
+async def stream_job_analysis(job_id: str):
     return StreamingResponse(
-        analysis_generator(
-            resume_text=resume.raw_text,
-            job_url=payload.job_url,
-            scraper_registry=scraper_registry
-        ),
+        analysis_generator(job_id=job_id),
         media_type="text/event-stream",
     )
