@@ -42,6 +42,21 @@ services:
       retries: 5
     networks:
       - ria
+  
+  pgbouncer:
+    image: edoburu/pgbouncer:latest
+    container_name: ria.pgbouncer
+    ports:
+      - 5430:5342
+    environment:
+      - DB_USER=${DB_USERNAME}
+      - DB_PASSWORD=${DB_PASSWORD}
+      - DB_HOST=db
+      - DB_NAME=${DB_DATABASE}
+      - AUTH_TYPE=scram-sha-256
+      - POOL_MODE=transaction
+    healthcheck:
+      test: ['CMD', 'pg_isready', '-h', 'localhost']
 
   queue:
     image: redis:8-alpine
