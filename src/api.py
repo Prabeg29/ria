@@ -17,6 +17,7 @@ from psycopg import sql
 from psycopg.rows import class_row
 from psycopg.types.json import Json
 from redis import Redis
+from redis.asyncio import Redis as AsyncRedis
 from rq.decorators import job
 
 from .database import db
@@ -33,10 +34,10 @@ from .text_processor import TextPreprocessor
 
 
 gemini_client = genai.Client(api_key=settings.gemini_api_key)
-redis_conn = Redis(host=settings.redis_host, decode_responses=True)
+redis_conn = AsyncRedis(host=settings.redis_host, decode_responses=True)
 
 
-@job("default", connection=redis_conn)
+@job("default", connection=Redis(host=settings.redis_host))
 async def process_and_save_resume(request_id: str, resume_id: uuid.UUID) -> None:
     REQUEST_ID_CTX.set(request_id)
     await db.open_pool()
@@ -258,12 +259,8 @@ async def upload_resume(
     return {"message": "Resume uploaded and processing initiated", "resume_id": str(resume.id)}
 
 
-def build_sse_event(data: dict, event_type: str = "message") -> str:
-    return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
-
-
-def publish(job_id: str, event_type: str, data: dict = {}):
-    redis_conn.xadd(
+async def publish(job_id: str, event_type: str, data: dict = {}):
+    await redis_conn.xadd(
         f"analysis:stream:{job_id}",
         {
             "type": event_type,
@@ -282,11 +279,12 @@ async def scrape_job_and_ingress_llm(
 ) -> None:
     REQUEST_ID_CTX.set(request_id)
 
-    publish(request_id, "status", {
+    await publish(request_id, "status", {
         "status": "scraping",
         "message": "Accessing job url..."
     })
 
+    # TODO: Fix the issue of not locating an element
     async with async_playwright() as p:
         browser = await p.firefox.connect(
             ws_endpoint="ws://browserless:3000/firefox/playwright?headless=true"
@@ -301,7 +299,7 @@ async def scrape_job_and_ingress_llm(
     
         job_data = await job_scraper.extract(page)
 
-    publish(request_id, "status", {
+    await publish(request_id, "status", {
         "status": "analyzing",
         "message": "Reasoning with AI"
     })
@@ -314,9 +312,9 @@ async def scrape_job_and_ingress_llm(
         )
     ):
         if chunk.text:
-            publish(request_id, "delta", {"text": chunk.text})
+            await publish(request_id, "delta", {"text": chunk.text})
 
-    publish(request_id, "done", {"status": "complete"})
+    await publish(request_id, "done", {"status": "complete"})
 
 
 @dataclass
@@ -347,6 +345,9 @@ async def analyze_resume(
     if resume is None:
         raise Exception(f"No resume found with ID {resume_id}.")
     
+    logger.info(f"[POST: /resumes/{resume_id}/analyze]: Resume dispatched for LLM analysis", extra={
+        "job_url": payload.job_url
+    })
     scrape_job_and_ingress_llm.delay( # type: ignore
         request_id=REQUEST_ID_CTX.get(),
         resume_text=resume.raw_text,
@@ -357,14 +358,20 @@ async def analyze_resume(
     return {"status": "queued", "job_id": REQUEST_ID_CTX.get()}
 
 
+def build_sse_event(data: dict, event_type: str = "message") -> str:
+    return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
+
+
 async def analysis_generator(job_id: str):
+    yield ":\n\n"
+
     stream_key = f"analysis:stream:{job_id}"
     last_id = "0-0"
 
     yield build_sse_event({"status": "listening"}, "status")
 
     while True:
-        messages = redis_conn.xread(
+        messages = await redis_conn.xread(
             {stream_key: last_id},
             block=5000,
             count=10,
@@ -373,7 +380,7 @@ async def analysis_generator(job_id: str):
         if not messages:
             continue
 
-        entries = messages[0][1][0] # type: ignore
+        entries = messages[0][1]
 
         for message_id, fields in entries:
             last_id = message_id
