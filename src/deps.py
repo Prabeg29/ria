@@ -2,7 +2,7 @@ from pathlib import Path
 
 from fastapi import Request
 
-from .database import db
+from .database import db_conn
 from .job_scraper import ScraperRegistry
 
 
@@ -11,7 +11,7 @@ def get_resume_upload_dir(request: Request) -> Path:
 
 
 async def get_db_connection():
-    async with db.connection() as  conn:
+    async with db_conn() as conn:
         yield conn
 
 

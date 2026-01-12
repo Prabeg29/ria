@@ -9,7 +9,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 
 from .api import router
-from .database import db, init_db
+from .database import init_db
 from .deps import get_db_connection
 from .job_scraper import ScraperRegistry, SeekJobScraper
 from .logger import REQUEST_ID_CTX, logger
@@ -21,8 +21,7 @@ async def lifespan(app: FastAPI):
     project_root = Path(__file__).resolve().parents[1]
     resume_upload_dir = project_root / "resumes"
     app.state.resume_upload_dir = resume_upload_dir
-   
-    await db.open_pool()
+
     logger.info("Initializing Database...")
     await init_db()
     logger.info("Database initialization completed")
@@ -31,8 +30,6 @@ async def lifespan(app: FastAPI):
     app.state.scraper_registry = ScraperRegistry
 
     yield
-
-    await db.close_pool()
 
 
 app = FastAPI(

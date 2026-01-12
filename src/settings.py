@@ -24,7 +24,7 @@ class Settings:
         if not self.db_database:
             return ""
 
-        return f"{self.db_dialect}://{self.db_username}:{self.db_password}@{self.db_host}:{self.db_port}/{self.db_database}"
+        return f"{self.db_dialect}://{self.db_username}:{self.db_password}@pgbouncer:{self.db_port}/{self.db_database}"
 
     gemini_api_key = os.getenv("GEMINI_API_KEY", "")
     gemini_model = os.getenv("GEMINI_MODEL", "gemini-pro")

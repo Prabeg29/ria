@@ -1,31 +1,14 @@
 from contextlib import asynccontextmanager
 
-from psycopg import sql
-from psycopg_pool import AsyncConnectionPool
+from psycopg import AsyncConnection, sql
 
 from .settings import settings
 
 
-class DatabaseSessionManager:
-    def __init__(self, dsn: str | None = ""):
-        if not dsn:
-            raise Exception("Database url not found")
-        
-        self._pool = AsyncConnectionPool(dsn, open=False)
-
-    async def open_pool(self):
-        await self._pool.open()
-
-    async def close_pool(self):
-        await self._pool.close()
-
-    @asynccontextmanager
-    async def connection(self):
-        async with self._pool.connection() as aconn:
-            yield aconn
-
-
-db = DatabaseSessionManager(settings.db_url)
+@asynccontextmanager
+async def db_conn():
+    async with await AsyncConnection.connect(settings.db_url) as aconn:
+        yield aconn
 
 
 async def init_db():
@@ -52,7 +35,6 @@ async def init_db():
         ),
     ]
 
-    async with db.connection() as conn:
+    async with db_conn() as conn:
         for query in INIT_DB_QUERIES:
             await conn.execute(query=query)
-
