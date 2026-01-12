@@ -20,7 +20,7 @@ from redis import Redis
 from redis.asyncio import Redis as AsyncRedis
 from rq.decorators import job
 
-from .database import db
+from .database import db_conn
 from .deps import (
     get_resume_upload_dir,
     get_db_connection,
@@ -40,9 +40,8 @@ redis_conn = AsyncRedis(host=settings.redis_host, decode_responses=True)
 @job("default", connection=Redis(host=settings.redis_host))
 async def process_and_save_resume(request_id: str, resume_id: uuid.UUID) -> None:
     REQUEST_ID_CTX.set(request_id)
-    await db.open_pool()
     try:
-        async with db.connection() as aconn:
+        async with db_conn() as aconn:
             async with aconn.cursor(row_factory=class_row(Resume)) as cur:
                 await cur.execute("""
                     SELECT
@@ -79,7 +78,7 @@ async def process_and_save_resume(request_id: str, resume_id: uuid.UUID) -> None
 
         parsed_data = json.loads(json.dumps(clean))
         
-        async with db.connection() as aconn:
+        async with db_conn() as aconn:
             await aconn.execute("""
                     UPDATE resumes
                     SET parsed_data = %s,
@@ -96,8 +95,6 @@ async def process_and_save_resume(request_id: str, resume_id: uuid.UUID) -> None
         })
     except Exception as e:
         logger.error(f"Error processing resume with (ID: {resume_id}): {e}")
-    finally:
-        await db.close_pool()
     
 
 s3_client = boto3.client(
@@ -115,7 +112,6 @@ async def upload_resume_to_s3(request_id:str, resume_id: uuid.UUID, file_path: P
         "filename": file_path.name,
         "resume_id": resume_id,
     })
-    await db.open_pool()
     try:
         s3_object_name = f"{resume_id}_{file_path.name}"
         s3_client.upload_file(
@@ -130,7 +126,7 @@ async def upload_resume_to_s3(request_id:str, resume_id: uuid.UUID, file_path: P
             "resume_id": resume_id,
         })
 
-        async with db.connection() as aconn:
+        async with db_conn() as aconn:
             await aconn.execute("""
                     UPDATE resumes
                     SET s3_url = %s,
@@ -148,8 +144,6 @@ async def upload_resume_to_s3(request_id:str, resume_id: uuid.UUID, file_path: P
         })
     except Exception as e:
         logger.error("[S3 Resume Upload]: Failed to upload resume to S3", e)
-    finally:
-        await db.close_pool()
 
 
 router = APIRouter(prefix="")
