@@ -42,6 +42,21 @@ services:
       retries: 5
     networks:
       - ria
+  
+  pgbouncer:
+    image: edoburu/pgbouncer:latest
+    container_name: ria.pgbouncer
+    ports:
+      - 5430:5342
+    environment:
+      - DB_USER=${DB_USERNAME}
+      - DB_PASSWORD=${DB_PASSWORD}
+      - DB_HOST=db
+      - DB_NAME=${DB_DATABASE}
+      - AUTH_TYPE=scram-sha-256
+      - POOL_MODE=transaction
+    healthcheck:
+      test: ['CMD', 'pg_isready', '-h', 'localhost']
 
   queue:
     image: redis:8-alpine
@@ -94,5 +109,25 @@ services:
       - ./poetry.lock:/opt/app/poetry.lock
       - resumes:/opt/app/resumes
     command: poetry run rq worker default --verbose
+    networks:
+      - ria
+
+  browserless:
+    image: ghcr.io/browserless/firefox
+    container_name: ria.browserless
+    depends_on:
+      - api
+    environment:
+      - CONCURRENT=3
+      - QUEUED=3
+      - TIMEOUT=100000
+    ports:
+      - 3000:3000
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/pressure"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
     networks:
       - ria

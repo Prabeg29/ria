@@ -2,6 +2,7 @@ import json
 import uuid
 
 from datetime import datetime
+from dataclasses import dataclass
 from pathlib import Path
 
 import aiofiles
@@ -9,27 +10,36 @@ import boto3
 import pymupdf
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, status
+from fastapi.responses import StreamingResponse
 from google import genai
+from playwright.async_api import async_playwright
 from psycopg import sql
 from psycopg.rows import class_row
 from psycopg.types.json import Json
 from redis import Redis
+from redis.asyncio import Redis as AsyncRedis
 from rq.decorators import job
 
 from .database import db
-from .deps import get_resume_upload_dir, get_db_connection
-from .logger import logger
+from .deps import (
+    get_resume_upload_dir,
+    get_db_connection,
+    get_scraper_registry,
+)
+from .logger import REQUEST_ID_CTX, logger
 from .models import Resume
-from .prompts import EXTRACT_RESUME_PROMPT
+from .prompts import EXTRACT_RESUME_PROMPT, ANALYZE_RESUME_AGAINST_JOB_PROMPT
 from .settings import settings
 from .text_processor import TextPreprocessor
 
 
 gemini_client = genai.Client(api_key=settings.gemini_api_key)
+redis_conn = AsyncRedis(host=settings.redis_host, decode_responses=True)
 
 
 @job("default", connection=Redis(host=settings.redis_host))
-async def process_and_save_resume(resume_id: uuid.UUID) -> None:
+async def process_and_save_resume(request_id: str, resume_id: uuid.UUID) -> None:
+    REQUEST_ID_CTX.set(request_id)
     await db.open_pool()
     try:
         async with db.connection() as aconn:
@@ -99,7 +109,8 @@ s3_client = boto3.client(
 
 
 @job("default", connection=Redis(host=settings.redis_host))
-async def upload_resume_to_s3(resume_id: uuid.UUID, file_path: Path) -> None:
+async def upload_resume_to_s3(request_id:str, resume_id: uuid.UUID, file_path: Path) -> None:
+    REQUEST_ID_CTX.set(request_id)
     logger.info("Starting S3 upload", extra={
         "filename": file_path.name,
         "resume_id": resume_id,
@@ -159,7 +170,7 @@ async def upload_resume(
 ):
     if not file.filename or not file.filename.strip():
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="Filename is required",
         )
 
@@ -189,7 +200,7 @@ async def upload_resume(
             .get_text()
     )
 
-    if not text:
+    if not raw_text:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="File is empty.",
@@ -239,10 +250,153 @@ async def upload_resume(
     logger.info(f"[POST: /resumes/upload]: Resume dispatched for LLM extraction", extra={
         "resume_id": resume.id,
     })
-    process_and_save_resume.delay(resume.id)  # type: ignore
-    # logger.info(f"[POST: /resumes/upload]: Resume dispatched for S3 uploads", extra={
-    #     "resume_id": resume.id,
-    # })
-    # upload_resume_to_s3.delay(resume.id, destination_path,)  # type: ignore
+    process_and_save_resume.delay(REQUEST_ID_CTX.get(), resume.id)  # type: ignore
+    logger.info(f"[POST: /resumes/upload]: Resume dispatched for S3 uploads", extra={
+        "resume_id": resume.id,
+    })
+    upload_resume_to_s3.delay(REQUEST_ID_CTX.get(), resume.id, destination_path,)  # type: ignore
 
     return {"message": "Resume uploaded and processing initiated", "resume_id": str(resume.id)}
+
+
+async def publish(job_id: str, event_type: str, data: dict = {}):
+    await redis_conn.xadd(
+        f"analysis:stream:{job_id}",
+        {
+            "type": event_type,
+            "payload": json.dumps(data)
+        }
+    )
+
+
+@job("default", connection=Redis(host=settings.redis_host))
+async def scrape_job_and_ingress_llm(
+    *,
+    request_id: str,
+    resume_text: str,
+    job_url: str,
+    job_scraper,
+) -> None:
+    REQUEST_ID_CTX.set(request_id)
+
+    await publish(request_id, "status", {
+        "status": "scraping",
+        "message": "Accessing job url..."
+    })
+
+    # TODO: Fix the issue of not locating an element
+    async with async_playwright() as p:
+        browser = await p.firefox.connect(
+            ws_endpoint="ws://browserless:3000/firefox/playwright?headless=true"
+        )
+        page = await browser.new_page()
+    
+        await page.route("**/*.{png,jpg,jpeg,gif,css,woff2}", lambda route: route.abort())
+        await page.goto(
+            url=job_url,
+            wait_until="domcontentloaded",
+        )
+    
+        job_data = await job_scraper.extract(page)
+
+    await publish(request_id, "status", {
+        "status": "analyzing",
+        "message": "Reasoning with AI"
+    })
+    
+    async for chunk in await gemini_client.aio.models.generate_content_stream(
+        model=settings.gemini_model,
+        contents=ANALYZE_RESUME_AGAINST_JOB_PROMPT.format(
+            resume_raw_text=resume_text,
+            job=job_data
+        )
+    ):
+        if chunk.text:
+            await publish(request_id, "delta", {"text": chunk.text})
+
+    await publish(request_id, "done", {"status": "complete"})
+
+
+@dataclass
+class ResumeAnalyzeSchema:
+    job_url: str
+
+
+@router.post("/resumes/{resume_id}/analyze", status_code=status.HTTP_202_ACCEPTED)
+async def analyze_resume(
+    resume_id: str,
+    payload: ResumeAnalyzeSchema,
+    db_conn=Depends(get_db_connection),
+    scraper_registry=Depends(get_scraper_registry),
+):
+    async with db_conn.cursor(row_factory=class_row(Resume)) as cur:
+        await cur.execute("""
+                SELECT
+                    resumes.id,
+                    resumes.raw_text
+                FROM resumes
+                WHERE resumes.id = %s
+            """,
+            (resume_id,),
+            )
+            
+        resume = await cur.fetchone()
+
+    if resume is None:
+        raise Exception(f"No resume found with ID {resume_id}.")
+    
+    logger.info(f"[POST: /resumes/{resume_id}/analyze]: Resume dispatched for LLM analysis", extra={
+        "job_url": payload.job_url
+    })
+    scrape_job_and_ingress_llm.delay( # type: ignore
+        request_id=REQUEST_ID_CTX.get(),
+        resume_text=resume.raw_text,
+        job_url=payload.job_url,
+        job_scraper=scraper_registry.resolve(payload.job_url),
+    )
+
+    return {"status": "queued", "job_id": REQUEST_ID_CTX.get()}
+
+
+def build_sse_event(data: dict, event_type: str = "message") -> str:
+    return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
+
+
+async def analysis_generator(job_id: str):
+    yield ":\n\n"
+
+    stream_key = f"analysis:stream:{job_id}"
+    last_id = "0-0"
+
+    yield build_sse_event({"status": "listening"}, "status")
+
+    while True:
+        messages = await redis_conn.xread(
+            {stream_key: last_id},
+            block=5000,
+            count=10,
+        )
+
+        if not messages:
+            continue
+
+        entries = messages[0][1]
+
+        for message_id, fields in entries:
+            last_id = message_id
+
+            event_type = fields["type"]
+            payload = json.loads(fields["payload"])
+
+            yield build_sse_event(payload, event_type)
+
+            if event_type == "done":
+                return
+
+
+@router.get("/analysis/{job_id}")
+async def stream_job_analysis(job_id: str):
+    return StreamingResponse(
+        analysis_generator(job_id=job_id),
+        media_type="text/event-stream",
+    )
