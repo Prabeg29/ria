@@ -157,17 +157,17 @@ async def scrape_job(job_url: str, job_scraper: JobScraper):
         browser = await p.firefox.connect(
             ws_endpoint="ws://browserless:3000/firefox/playwright?headless=false"
         )
-        page = await browser.new_page()
-    
-        # await page.route("**/*.{png,jpg,jpeg,gif,css,woff2}", lambda route: route.abort())
-        await page.goto(
-            url=job_url,
-            wait_until="domcontentloaded",
-        )
-
-        job_details = await job_scraper.extract(page)
-    
-        return job_details
+        try:
+            page = await browser.new_page()
+        
+            await page.route("**/*.{png,jpg,jpeg,gif,css,woff2}", lambda route: route.abort())
+            await page.goto(
+                url=job_url,
+                wait_until="domcontentloaded",
+            )
+            return await job_scraper.extract(page)
+        finally:
+            await browser.close()
 
 
 def is_retryable_error(e: Exception) -> bool:
