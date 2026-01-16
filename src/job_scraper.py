@@ -5,7 +5,7 @@ from urllib.parse import urlparse
 
 class JobScraper(ABC):
     @abstractmethod
-    async def extract(self, page) -> dict:
+    async def extract(self, page) -> dict[str, str]:
         pass
 
 
