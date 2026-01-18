@@ -44,7 +44,7 @@ async def init_db():
                     is_active BOOLEAN NOT NULL DEFAULT true
                 );
             """
-        )
+        ),
         sql.SQL(
             """
                 CREATE INDEX IF NOT EXISTS ix_ria_scraped_jobs_id ON ria.scraped_jobs (id);
