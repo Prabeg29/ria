@@ -33,6 +33,23 @@ async def init_db():
         CREATE INDEX IF NOT EXISTS ix_ria_resumes_id ON ria.resumes (id);
         """
         ),
+        sql.SQL(
+            """
+                CREATE TABLE IF NOT EXISTS ria.scraped_jobs(
+                    id UUID NOT NULL,
+                    url TEXT NOT NULL,
+                    url_hash CHAR(64) UNIQUE NOT NULL,
+                    scraped_data JSONB NOT NULL,
+                    scraped_at TIMESTAMP NOT NULL,
+                    is_active BOOLEAN NOT NULL DEFAULT true
+                );
+            """
+        )
+        sql.SQL(
+            """
+                CREATE INDEX IF NOT EXISTS ix_ria_scraped_jobs_id ON ria.scraped_jobs (id);
+            """
+        ),
     ]
 
     async with db_conn() as conn:
