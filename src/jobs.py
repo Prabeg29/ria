@@ -2,6 +2,7 @@ import json
 import uuid
 
 from pathlib import Path
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import boto3
 
@@ -146,12 +147,6 @@ async def upload_resume_to_s3(request_id:str, resume_id: uuid.UUID, file_path: P
         logger.error("[S3 Resume Upload]: Failed to upload resume to S3", e)
 
 
-@retry(
-    before_sleep=before_sleep_log(logger, 40),
-    retry=retry_if_exception_type((TimeoutError,)),
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=2, max=10)
-)
 async def scrape_job(job_url: str, job_scraper: JobScraper):
     async with async_playwright() as p:
         browser = await p.firefox.connect(
@@ -214,10 +209,12 @@ async def scrape_job_and_ingress_llm(
         "message": "Accessing job url..."
     })
 
-    job_data = await scrape_job(job_url=job_url, job_scraper=job_scraper)
+    normalized_job_url = job_scraper.normalize(url=job_url)
+    job_data = await scrape_job(job_url=normalized_job_url, job_scraper=job_scraper)
 
     logger.info("[Scrape job and ingest llm]: Changing job details", extra={
-        "job_url": job_url
+        "raw_job_url": job_url,
+        "normalize_job_url": normalized_job_url,
     })
     await publish(request_id, "status", {
         "status": "analyzing",
