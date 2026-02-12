@@ -42,6 +42,9 @@ async def init_db():
                     scraped_data JSONB NOT NULL,
                     scraped_at TIMESTAMP NOT NULL,
                     is_active BOOLEAN NOT NULL DEFAULT true
+                    created_at TIMESTAMP DEFAULT NOW() NOT NULL,
+                    updated_at TIMESTAMP DEFAULT NOW () NOT NULL,
+                    deleted_at TIMESTAMP,
                 );
             """
         ),
