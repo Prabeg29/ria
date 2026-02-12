@@ -2,23 +2,18 @@ import json
 import uuid
 
 from pathlib import Path
-from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import boto3
 
 from google import genai
 from google.genai.errors import ClientError, ServerError
-from playwright.async_api import (
-    TimeoutError,
-    async_playwright,
-)
+from playwright.async_api import async_playwright
 from psycopg.rows import class_row
 from psycopg.types.json import Json
 from rq.decorators import job
 from tenacity import (
     before_sleep_log,
     retry,
-    retry_if_exception_type,
     retry_if_result,
     stop_after_attempt,
     wait_exponential,
@@ -156,10 +151,17 @@ async def scrape_job(job_url: str, job_scraper: JobScraper):
             page = await browser.new_page()
         
             await page.route("**/*.{png,jpg,jpeg,gif,css,woff2}", lambda route: route.abort())
-            await page.goto(
+
+            response = await page.goto(
                 url=job_url,
                 wait_until="domcontentloaded",
             )
+            
+            if response and response.status == status.HTTP_404_NOT_FOUND:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="No job found for given url",
+                )
             return await job_scraper.extract(page)
         finally:
             await browser.close()
@@ -201,21 +203,80 @@ async def scrape_job_and_ingress_llm(
 ) -> None:
     REQUEST_ID_CTX.set(request_id)
 
+    # 1. Check if the job_details exists in Redis
+    # 2. If not check if the job_details saved to DB
+
+    async with db_conn() as aconn:
+        async with aconn.cursor(row_factory=class_row(Resume)) as cur:
+            await cur.execute("""
+                SELECT
+                    scraped_jobs.id,
+                    scraped_jobs.scraped_data,
+                    scraped_jobs.scraped_at,
+                    scraped_jobs.is_active,
+                FROM scraped_jobs
+                WHERE scraped_jobs.url_hash = %s
+            """,
+                (job_url,),
+            )
+            scraped_job = await cur.fetchone()
+
+    if scraped_job is not None:
+        raise Exception(f"No resume found with ID {resume_id}.")
+
+    # 3. If saved to DB but stale (say more than 24 hours) scrape
+    # 4. If saved to DB but stale, however when scraped if job inactive set to inactive
+    
+    normalized_job_url = job_scraper.normalize(url=job_url)
+
     logger.info("[Scrape job and ingest llm]: Scraping job details", extra={
-        "job_url": job_url
+        "raw_job_url": job_url,
+        "normalized_url": normalized_job_url,
     })
     await publish(request_id, "status", {
         "status": "scraping",
         "message": "Accessing job url..."
     })
 
-    normalized_job_url = job_scraper.normalize(url=job_url)
-    job_data = await scrape_job(job_url=normalized_job_url, job_scraper=job_scraper)
+    job_data = None
+    is_active = True
 
-    logger.info("[Scrape job and ingest llm]: Changing job details", extra={
-        "raw_job_url": job_url,
-        "normalize_job_url": normalized_job_url,
-    })
+    try:
+        job_data = await scrape_job(job_url=normalized_job_url, job_scraper=job_scraper)
+    except Exception as ex:
+        if not scraped_job:
+            raise ex    
+        is_active = False
+
+    async with db_conn() as aconn:
+        await aconn.execute(
+            query="""
+                INSERT INTO ria.scraped_jobs (
+                    id,
+                    url,
+                    url_hash,
+                    scraped_data,
+                    scraped_at,
+                    is_active
+                )
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (url_hash)
+                DO UPDATE SET
+                    scraped_data=EXCLUDED.scraped_data,
+                    scraped_at=EXCLUDED.scraped_at,
+                    is_active=EXCLUDED.is_active;
+            """,
+            params=(
+                request_id,
+                normalized_job_url,
+                "url_hash",
+                job_data,
+                "scraped_at",
+                is_active
+
+            )
+        )
+
     await publish(request_id, "status", {
         "status": "analyzing",
         "message": "Reasoning with AI"
