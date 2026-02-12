@@ -55,3 +55,14 @@ class Resume(BaseModel, SoftDeleteMixin):
     raw_text: str | None = None
     parsed_data: dict[str, Any] = field(default_factory=dict)
     s3_url: str | None = None
+
+
+# ---------------------------
+# ScrapedJob
+# ---------------------------
+@dataclass
+class ScrapedJob(BaseModel, SoftDeleteMixin):
+    url: str = ""
+    url_hash: str = "" 
+    scraped_data: dict[str, Any] = field(default_factory=dict)
+    is_active: bool = True
