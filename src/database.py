@@ -41,16 +41,21 @@ async def init_db():
                     url_hash CHAR(64) UNIQUE NOT NULL,
                     scraped_data JSONB NOT NULL,
                     scraped_at TIMESTAMP NOT NULL,
-                    is_active BOOLEAN NOT NULL DEFAULT true
+                    is_active BOOLEAN NOT NULL DEFAULT true,
                     created_at TIMESTAMP DEFAULT NOW() NOT NULL,
                     updated_at TIMESTAMP DEFAULT NOW () NOT NULL,
-                    deleted_at TIMESTAMP,
+                    deleted_at TIMESTAMP
                 );
             """
         ),
         sql.SQL(
             """
                 CREATE INDEX IF NOT EXISTS ix_ria_scraped_jobs_id ON ria.scraped_jobs (id);
+            """
+        ),
+        sql.SQL(
+            """
+                CREATE INDEX IF NOT EXISTS ix_ria_scraped_jobs_url_hash ON ria.scraped_jobs (url_hash);
             """
         ),
     ]
