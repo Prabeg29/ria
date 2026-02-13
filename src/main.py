@@ -26,7 +26,7 @@ async def lifespan(app: FastAPI):
     await init_db()
     logger.info("Database initialization completed")
 
-    ScraperRegistry.register("www.seek.com.au", SeekJobScraper)
+    ScraperRegistry.register("seek.com.au", SeekJobScraper)
     app.state.scraper_registry = ScraperRegistry
 
     yield
