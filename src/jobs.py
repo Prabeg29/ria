@@ -1,10 +1,12 @@
 import json
+import hashlib
 import uuid
 
 from pathlib import Path
 
 import boto3
 
+from fastapi import HTTPException, status
 from google import genai
 from google.genai.errors import ClientError, ServerError
 from playwright.async_api import async_playwright
@@ -22,7 +24,7 @@ from tenacity import (
 from .database import db_conn
 from .logger import REQUEST_ID_CTX, logger
 from .job_scraper import JobScraper
-from .models import Resume
+from .models import Resume, ScrapedJob
 from .prompts import (
     ANALYZE_RESUME_AGAINST_JOB_PROMPT,
     EXTRACT_RESUME_PROMPT,
@@ -193,6 +195,12 @@ async def ingest_llm(resume_text: str, job_data):
     )
 
 
+def hash_url(normalized_url: str) -> str:
+    return hashlib.sha256(
+        normalized_url.encode("utf-8")
+    ).hexdigest()
+
+
 @job("default", connection=redis)
 async def scrape_job_and_ingress_llm(
     *,
@@ -203,92 +211,109 @@ async def scrape_job_and_ingress_llm(
 ) -> None:
     REQUEST_ID_CTX.set(request_id)
 
+    normalized_job_url = job_scraper.normalize(url=job_url)
+    url_hash = hash_url(normalized_job_url)
+
     # 1. Check if the job_details exists in Redis
     # 2. If not check if the job_details saved to DB
 
-    async with db_conn() as aconn:
-        async with aconn.cursor(row_factory=class_row(Resume)) as cur:
-            await cur.execute("""
-                SELECT
-                    scraped_jobs.id,
-                    scraped_jobs.scraped_data,
-                    scraped_jobs.scraped_at,
-                    scraped_jobs.is_active,
-                FROM scraped_jobs
-                WHERE scraped_jobs.url_hash = %s
-            """,
-                (job_url,),
-            )
-            scraped_job = await cur.fetchone()
-
-    if scraped_job is not None:
-        raise Exception(f"No resume found with ID {resume_id}.")
-
-    # 3. If saved to DB but stale (say more than 24 hours) scrape
-    # 4. If saved to DB but stale, however when scraped if job inactive set to inactive
-    
-    normalized_job_url = job_scraper.normalize(url=job_url)
-
-    logger.info("[Scrape job and ingest llm]: Scraping job details", extra={
-        "raw_job_url": job_url,
-        "normalized_url": normalized_job_url,
-    })
-    await publish(request_id, "status", {
-        "status": "scraping",
-        "message": "Accessing job url..."
-    })
-
-    job_data = None
-    is_active = True
-
     try:
-        job_data = await scrape_job(job_url=normalized_job_url, job_scraper=job_scraper)
-    except Exception as ex:
-        if not scraped_job:
-            raise ex    
-        is_active = False
-
-    async with db_conn() as aconn:
-        await aconn.execute(
-            query="""
-                INSERT INTO ria.scraped_jobs (
-                    id,
-                    url,
-                    url_hash,
-                    scraped_data,
-                    scraped_at,
-                    is_active
+        async with db_conn() as aconn:
+            async with aconn.cursor(row_factory=class_row(ScrapedJob)) as cur:
+                await cur.execute("""
+                    SELECT
+                        scraped_jobs.id,
+                        scraped_jobs.scraped_data,
+                        scraped_jobs.scraped_at,
+                        (scraped_jobs.scraped_at < NOW() - INTERVAL '24 hours') AS is_stale,
+                        scraped_jobs.is_active
+                    FROM scraped_jobs
+                    WHERE scraped_jobs.url_hash = %s
+                """,
+                    (url_hash,),
                 )
-                VALUES (%s, %s, %s, %s, %s, %s)
-                ON CONFLICT (url_hash)
-                DO UPDATE SET
-                    scraped_data=EXCLUDED.scraped_data,
-                    scraped_at=EXCLUDED.scraped_at,
-                    is_active=EXCLUDED.is_active;
-            """,
-            params=(
-                request_id,
-                normalized_job_url,
-                "url_hash",
-                job_data,
-                "scraped_at",
-                is_active
+                scraped_job = await cur.fetchone()
 
-            )
+        if (
+            scraped_job is None or
+            scraped_job.is_stale
+        ):
+            logger.info("[Scrape job and ingest llm]: Scraping job details", extra={
+                "raw_job_url": job_url,
+                "normalized_url": normalized_job_url,
+                "url_hash": url_hash
+            })
+            await publish(request_id, "status", {
+                "status": "scraping",
+                "message": "Accessing job url..."
+            })
+
+            job_data = None
+            is_active = True
+
+            try:
+                job_data = await scrape_job(job_url=normalized_job_url, job_scraper=job_scraper)
+            except Exception as ex:
+                if not scraped_job:
+                    raise ex    
+                is_active = False
+
+            scraped_job = ScrapedJob()
+
+            async with db_conn() as aconn:
+                await aconn.execute(
+                    query="""
+                        INSERT INTO ria.scraped_jobs (
+                            id,
+                            url,
+                            url_hash,
+                            scraped_data,
+                            scraped_at,
+                            is_active,
+                            created_at,
+                            updated_at
+                        )
+                        VALUES (%s, %s, %s, %s, NOW(), %s, NOW(), NOW())
+                        ON CONFLICT (url_hash)
+                        DO UPDATE SET
+                            scraped_data=EXCLUDED.scraped_data,
+                            scraped_at=EXCLUDED.scraped_at,
+                            is_active=EXCLUDED.is_active,
+                            updated_at=EXCLUDED.updated_at;
+                    """,
+                    params=(
+                        request_id,
+                        normalized_job_url,
+                        url_hash,
+                        Json(job_data),
+                        is_active
+                    )
+                )
+        logger.info("[Scrape job and ingest llm]: Reasoning with AI", extra={
+            "raw_job_url": job_url,
+            "normalized_url": normalized_job_url,
+            "url_hash": url_hash
+        })
+
+        await publish(request_id, "status", {
+            "status": "analyzing",
+            "message": "Reasoning with AI"
+        })
+
+        response_stream = await ingest_llm(
+            resume_text=resume_text,
+            job_data=scraped_job.scraped_data
         )
+        
+        async for chunk in response_stream:
+            if chunk.text:
+                await publish(request_id, "delta", {"text": chunk.text})
 
-    await publish(request_id, "status", {
-        "status": "analyzing",
-        "message": "Reasoning with AI"
-    })
-
-    response_stream = await ingest_llm(
-        resume_text=resume_text,
-        job_data=job_data
-    )
-    
-    async for chunk in response_stream:
-        if chunk.text:
-            await publish(request_id, "delta", {"text": chunk.text})
-
-    await publish(request_id, "done", {"status": "complete"}) 
+        await publish(request_id, "done", {"status": "complete"}) 
+    except Exception as ex:
+        logger.error("[Scrape job and ingest llm]: Job failed", exc_info=False, extra={
+            "raw_job_url": job_url,
+            "normalized_url": normalized_job_url,
+            "url_hash": url_hash
+        })
+        await publish(request_id, "done", {"status": "failed"}) 
