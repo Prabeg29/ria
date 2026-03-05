@@ -23,31 +23,28 @@ services:
       - 5430:5432
     volumes:
       - ./db_data:/var/lib/postgresql/data
-      - ./docker/scripts/postgres:/docker-entrypoint-initdb.d
+      - ./docker/postgres:/docker-entrypoint-initdb.d
     networks:
       - ria
 
+
   db_client:
-    image: dpage/pgadmin4
+    image: adminer
     container_name: ria.db_client
+    restart: always
     ports:
-      - 5050:80
-    environment:
-      PGADMIN_DEFAULT_EMAIL: user@example.com
-      PGADMIN_DEFAULT_PASSWORD: test
-    healthcheck:
-      test: ["CMD-SHELL", "redis-cli ping"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
+      - 5050:8080
     networks:
       - ria
+
   
   pgbouncer:
     image: edoburu/pgbouncer:latest
     container_name: ria.pgbouncer
     ports:
-      - 5430:5342
+      - 5431:5342
+    depends_on:
+      - db
     environment:
       - DB_USER=${DB_USERNAME}
       - DB_PASSWORD=${DB_PASSWORD}
@@ -57,6 +54,8 @@ services:
       - POOL_MODE=transaction
     healthcheck:
       test: ['CMD', 'pg_isready', '-h', 'localhost']
+    networks:
+      - ria
 
   queue:
     image: redis:8-alpine
@@ -83,7 +82,7 @@ services:
     env_file:
       - .env
     depends_on:
-      - db
+      - pgbouncer
       - queue
     volumes:
       - ./src:/opt/app/src
@@ -98,9 +97,10 @@ services:
 
   worker:
     image: ria/base
-    container_name: ria.worker
     depends_on:
+      - pgbouncer
       - queue
+      - browserless
     env_file:
      - .env
     volumes:
@@ -108,7 +108,9 @@ services:
       - ./pyproject.toml:/opt/app/pyproject.toml
       - ./poetry.lock:/opt/app/poetry.lock
       - resumes:/opt/app/resumes
-    command: poetry run rq worker default --verbose
+    deploy:
+      replicas: 3
+    command: poetry run rq worker default --verbose --with-scheduler
     networks:
       - ria
 

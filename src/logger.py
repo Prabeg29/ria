@@ -61,12 +61,12 @@ LOGGING_CONFIG = {
         "console": {
             "class": "logging.StreamHandler",
             "formatter": "json",
-            "filters": ["context_filter"],
             "stream": "ext://sys.stdout",
         },
         "queue_handler": {
             "class": "logging.handlers.QueueHandler",
             "queue": None,
+            "filters": ["context_filter"],
         },
     },
     "loggers": {

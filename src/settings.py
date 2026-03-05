@@ -1,6 +1,7 @@
 import os
 
 from dotenv import load_dotenv
+from redis import Redis
 
 load_dotenv(verbose=True)
 
@@ -8,6 +9,8 @@ load_dotenv(verbose=True)
 class Settings:
     app_name = os.getenv("APP_NAME", "RIA")
     app_env = os.getenv("APP_ENV", "development")
+    
+    browerless_ws = os.getenv("BROWSERLESS_WS", "")
 
     log_level = os.getenv("LOG_LEVEL", "INFO")
 
@@ -35,6 +38,10 @@ class Settings:
     aws_bucket = os.getenv("AWS_BUCKET", "")
 
     redis_host = os.getenv("REDIS_HOST", "localhost")
+    redis_port = int(os.getenv("REDIS_PORT", 6379))
 
+    @property
+    def redis_conn(self):
+        return Redis(host=self.redis_host, port=self.redis_port)
 
 settings = Settings()
