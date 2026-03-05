@@ -67,6 +67,7 @@ class SeekJobScraper(JobScraper):
         return {
             "daterange",
             "page",
+            "jobid",
         }
 
     @override
