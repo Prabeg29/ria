@@ -35,13 +35,23 @@ async def init_db():
         ),
         sql.SQL(
             """
+                DO $$ BEGIN
+                    CREATE TYPE scraping_status AS ENUM('queued', 'scraping', 'scraped', 'failed');
+                EXCEPTION
+                    WHEN duplicate_object THEN null;
+                END $$;
+            """
+        ),
+        sql.SQL(
+            """
                 CREATE TABLE IF NOT EXISTS ria.scraped_jobs(
                     id UUID NOT NULL,
-                    url TEXT NOT NULL,
+                    normalized_url TEXT NOT NULL,
                     url_hash CHAR(64) UNIQUE NOT NULL,
-                    scraped_data JSONB NOT NULL,
-                    scraped_at TIMESTAMP NOT NULL,
-                    is_active BOOLEAN NOT NULL DEFAULT true,
+                    status scraping_status DEFAULT 'queued',
+                    scraped_data JSONB,
+                    last_scraped_at TIMESTAMP,
+                    is_archived BOOLEAN DEFAULT false,
                     created_at TIMESTAMP DEFAULT NOW() NOT NULL,
                     updated_at TIMESTAMP DEFAULT NOW () NOT NULL,
                     deleted_at TIMESTAMP
