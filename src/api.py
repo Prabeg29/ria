@@ -1,4 +1,5 @@
 import json
+import uuid
 
 from datetime import datetime
 from dataclasses import dataclass
@@ -10,6 +11,8 @@ from fastapi import APIRouter, Depends, HTTPException, UploadFile, status
 from fastapi.responses import StreamingResponse
 from psycopg import sql
 from psycopg.rows import class_row
+from rq.exceptions import NoSuchJobError
+from rq.job import Job
 
 from .deps import (
     get_resume_upload_dir,
@@ -17,13 +20,21 @@ from .deps import (
     get_scraper_registry,
 )
 from .logger import REQUEST_ID_CTX, logger
-from .jobs import scrape_job_and_ingress_llm
+from .jobs import (
+    ingress_llm,
+    process_and_save_resume,
+    scrape_job_details,
+    upload_resume_to_s3,
+)
 from .models import Resume
+from .settings import settings
 from .redis import async_redis
 from .text_processor import TextPreprocessor
+from .utils import hash_url
 
 
 router = APIRouter(prefix="")
+
 
 VALID_FILE_FORMATS = {
     "application/pdf",
@@ -140,7 +151,7 @@ async def analyze_resume(
     resume_id: str,
     payload: ResumeAnalyzeSchema,
     db_conn=Depends(get_db_connection),
-    scraper_registry=Depends(get_scraper_registry),
+    scraper_registry=Depends(get_scraper_registry)
 ):
     async with db_conn.cursor(row_factory=class_row(Resume)) as cur:
         await cur.execute("""
@@ -158,14 +169,73 @@ async def analyze_resume(
     if resume is None:
         raise Exception(f"No resume found with ID {resume_id}.")
     
-    logger.info(f"[POST: /resumes/{resume_id}/analyze]: Resume dispatched for LLM analysis", extra={
-        "job_url": payload.job_url
-    })
-    scrape_job_and_ingress_llm.delay( # type: ignore
-        request_id=REQUEST_ID_CTX.get(),
-        resume_text=resume.raw_text,
-        job_url=payload.job_url,
-        job_scraper=scraper_registry.resolve(payload.job_url),
+    job_scraper = scraper_registry.resolve(payload.job_url)
+    normalized_url = job_scraper.normalize(payload.job_url)
+    url_hash = hash_url(normalized_url)
+
+    async with db_conn.cursor() as cur:
+        await cur.execute(
+            query="""
+                INSERT INTO scraped_jobs (
+                    id,
+                    normalized_url,
+                    url_hash,
+                    created_at,
+                    updated_at
+                )
+                VALUES (%s, %s, %s, NOW(), NOW())
+                ON CONFLICT (url_hash)
+                DO UPDATE SET
+                    status = 'queued',
+                    updated_at = EXCLUDED.updated_at
+                    WHERE scraped_jobs.last_scraped_at < NOW() - INTERVAL '24 hours'
+                    AND scraped_jobs.is_archived = false
+                    OR scraped_jobs.status NOT IN ('queued', 'scraping')
+                RETURNING id;
+            """, 
+        params=(str(uuid.uuid4()), normalized_url, url_hash))
+
+        row = await cur.fetchone()
+
+    scrape_job = None
+
+    if row:
+        logger.info(
+            "Queued scraping job details",
+            extra={
+                "raw_job_url": payload.job_url,
+                "normalized_job_url": normalized_url,
+                "url_hash": url_hash,
+            }
+        )
+
+        scrape_job = scrape_job_details.delay( # type: ignore
+            REQUEST_ID_CTX.get(),
+            job_scraper,
+            normalized_url,
+            url_hash,
+            job_id=url_hash,
+        )
+    else:
+        try:
+            scrape_job = Job.fetch(url_hash, connection=settings.redis_conn)
+        except NoSuchJobError:
+            pass
+
+    logger.info(
+        "Queued analyzing resume against job details",
+        extra={
+            "raw_job_url": payload.job_url,
+            "normalized_job_url": normalized_url,
+            "url_hash": url_hash,
+        }
+    )
+
+    ingress_llm.delay( # type: ignore
+        REQUEST_ID_CTX.get(),
+        resume.raw_text,
+        url_hash,
+        depends_on=scrape_job
     )
 
     return {"status": "queued", "job_id": REQUEST_ID_CTX.get()}
@@ -206,7 +276,7 @@ async def analysis_generator(job_id: str):
                 return
 
 
-@router.get("/analysis/{job_id}")
+@router.get("/analysis/{job_id}/stream")
 async def stream_job_analysis(job_id: str):
     return StreamingResponse(
         analysis_generator(job_id=job_id),
