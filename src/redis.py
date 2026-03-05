@@ -1,12 +1,10 @@
 import json
 
-from redis import Redis
 from redis.asyncio import Redis as AsyncRedis
 
 from .settings import settings
 
 
-redis = Redis(host=settings.redis_host)
 async_redis = AsyncRedis(host=settings.redis_host, decode_responses=True)
 
 
