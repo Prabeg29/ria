@@ -104,25 +104,39 @@ async def upload_resume(
         raw_text=raw_text,
     )
 
-    await db_conn.execute(
-        sql.SQL(
-            """
-                INSERT INTO ria.resumes (
-                    id,
-                    filename,
-                    raw_text,
-                    created_at,
-                    updated_at
-                )
-                VALUES (%s, %s, %s, NOW(), NOW())
-            """
-        ),
-        (
-            resume.id,
-            resume.filename,
-            resume.raw_text,
-        ),
-    )
+    async with db_conn.cursor() as cur:
+        await cur.execute(
+            sql.SQL(
+                """
+                    INSERT INTO ria.resumes (
+                        id,
+                        filename,
+                        raw_text,
+                        content_hash,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES (%s, %s, %s, %s, NOW(), NOW())
+                    ON CONFLICT (content_hash)
+                    DO NOTHING
+                    RETURNING id;
+                """
+            ),
+            (
+                resume.id,
+                resume.filename,
+                resume.raw_text,
+                content_hash,
+            ),
+        )
+
+        row = await cur.fetchone()
+
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="File has been previously uploaded, skipping processing",
+        )
     
     logger.info(f"[POST: /resumes/upload]: Resume dispatched for LLM extraction", extra={
         "resume_id": resume.id,
