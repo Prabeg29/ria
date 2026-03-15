@@ -18,6 +18,7 @@ from .deps import (
     get_resume_upload_dir,
     get_db_connection,
     get_scraper_registry,
+    verify_content_hash_header,
 )
 from .logger import REQUEST_ID_CTX, logger
 from .jobs import (
@@ -47,6 +48,7 @@ CHUNK_SIZE = 1024 * 1024  # 1MB
 @router.post("/resumes/upload")
 async def upload_resume(
     file: UploadFile,
+    content_hash: str = Depends(verify_content_hash_header),
     resume_upload_dir=Depends(get_resume_upload_dir),
     db_conn=Depends(get_db_connection),
 ):
@@ -95,39 +97,32 @@ async def upload_resume(
     destination_path = resume_upload_dir / timestamped_name
 
     async with aiofiles.open(destination_path, "wb") as out_file:
-        while content := await file.read(CHUNK_SIZE):
-            await out_file.write(content)
-
-    logger.info(f"[POST: /resumes/upload]: File saved to {resume_upload_dir}", extra={
-        "uploaded_resume": timestamped_name,
-    })
+        await out_file.write(content_buffer)
 
     resume = Resume(
-        filename=file.filename,
+        filename=timestamped_name,
         raw_text=raw_text,
-        parsed_data={},
-        s3_url=None,
     )
 
-    query = sql.SQL("""
-            INSERT INTO ria.resumes (id, filename, raw_text, parsed_data, s3_url, created_at, updated_at)
-            VALUES (%s, %s, %s, %s, %s, NOW(), NOW())
-        """
-        )
     await db_conn.execute(
-        query,
+        sql.SQL(
+            """
+                INSERT INTO ria.resumes (
+                    id,
+                    filename,
+                    raw_text,
+                    created_at,
+                    updated_at
+                )
+                VALUES (%s, %s, %s, NOW(), NOW())
+            """
+        ),
         (
             resume.id,
             resume.filename,
             resume.raw_text,
-            json.dumps(resume.parsed_data),
-            resume.s3_url,
         ),
     )
-
-    logger.info(f"[POST: /resumes/upload]: Resume saved to db", extra={
-        "resume_id": resume.id,
-    })
     
     logger.info(f"[POST: /resumes/upload]: Resume dispatched for LLM extraction", extra={
         "resume_id": resume.id,
