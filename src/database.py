@@ -68,6 +68,16 @@ async def init_db():
                 CREATE INDEX IF NOT EXISTS ix_ria_scraped_jobs_url_hash ON ria.scraped_jobs (url_hash);
             """
         ),
+        sql.SQL(
+            """
+                ALTER TABLE ria.resumes ADD COLUMN IF NOT EXISTS content_hash CHAR(64) UNIQUE;
+            """
+        ),
+        sql.SQL(
+            """
+                CREATE INDEX IF NOT EXISTS ix_ria_resumes_content_hash ON ria.resumes (content_hash);
+            """
+        ),
     ]
 
     async with db_conn() as conn:
