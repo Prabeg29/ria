@@ -78,6 +78,11 @@ async def init_db():
                 CREATE INDEX IF NOT EXISTS ix_ria_resumes_content_hash ON ria.resumes (content_hash);
             """
         ),
+        sql.SQL(
+            """
+                ALTER TABLE ria.resumes ADD COLUMN IF NOT EXISTS last_upload_presigned_url_generated_at TIMESTAMP;
+            """
+        ),
     ]
 
     async with db_conn() as conn:

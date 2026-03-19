@@ -1,4 +1,5 @@
 import json
+import random
 import uuid
 
 from pathlib import Path
@@ -34,66 +35,93 @@ from .settings import settings
 
 gemini_client = genai.Client(api_key=settings.gemini_api_key)
 
+def retry_with_exponential_backoff(
+    retry: int,
+    initial: float = 1,
+    max_value: float = 300,
+    exp_base: float = 2,
+    jitter: float = 1
 
-@job("default", connection=settings.redis_conn)
+) -> Retry:
+    intervals = []
+    for attempt in range(retry):
+        jitter = random.uniform(0, jitter)
+        try:
+            exp = exp_base ** attempt
+            result = initial * exp + jitter
+        except OverflowError:
+            result = max_value
+        intervals.append(max(0, min(result, max_value)))
+    return Retry(retry, intervals)
+
+
+def handle_retry(job, connection, type, value, traceback):
+    pass
+
+
+@job(
+    "llm",
+    connection=settings.redis_conn,
+    retry=retry_with_exponential_backoff(3),
+    on_failure=handle_retry
+)
 async def process_and_save_resume(request_id: str, resume_id: uuid.UUID) -> None:
     REQUEST_ID_CTX.set(request_id)
-    try:
-        async with db_conn() as aconn:
-            async with aconn.cursor(row_factory=class_row(Resume)) as cur:
-                await cur.execute("""
-                    SELECT
-                        resumes.id,
-                        resumes.filename,
-                        resumes.raw_text,
-                        resumes.parsed_data,
-                        resumes.updated_at
-                    FROM resumes
-                    WHERE resumes.id = %s
-                """,
-                    (resume_id,),
-                )
-                resume = await cur.fetchone()
-
-        if resume is None:
-            raise Exception(f"No resume found with ID {resume_id}.")
-
-        logger.info(f"Starting resume processing for {resume.filename} with ID {resume_id}.")
-        response = gemini_client.models.generate_content(
-            model=settings.gemini_model,
-            contents=EXTRACT_RESUME_PROMPT.format(text=resume.raw_text),
-        )
-
-        if response.text is None:
-            raise Exception(f"No response found for resume with ID {resume_id}.")
-
-        logger.info(f"Received response from Gemini", extra={
-            "resume_id": resume_id,
-            "resume_filename": resume.filename,
-        })
-
-        clean = response.text.strip().strip("`").replace("```json", "").replace("```", "")
-
-        parsed_data = json.loads(json.dumps(clean))
-        
-        async with db_conn() as aconn:
-            await aconn.execute("""
-                    UPDATE resumes
-                    SET parsed_data = %s,
-                    updated_at = NOW()
-                    WHERE id = %s
-                """,
-                (Json(parsed_data), resume.id,)
+    async with db_conn() as aconn:
+        async with aconn.cursor(row_factory=class_row(Resume)) as cur:
+            await cur.execute("""
+                SELECT
+                    resumes.id,
+                    resumes.raw_text,
+                    resumes.parsed_data
+                FROM resumes
+                WHERE resumes.id = %s
+            """,
+                (resume_id,),
             )
-            await aconn.commit()
+            resume = await cur.fetchone()
 
-        logger.info(f"Updated resume with parsed data", extra={
+    if resume is None:
+        logger.error(f"No resume found", extra={"resume_id": resume_id})
+        return
+
+    if resume.parsed_data:
+        logger.info("Resume already parsed, skipping llm ingress", extra={
             "resume_id": resume_id,
-            "resume_filename": resume.filename,
         })
-    except Exception as e:
-        logger.error(f"Error processing resume with (ID: {resume_id}): {e}")
+        return
+
+    logger.info(f"Extracting content in json...", extra={
+        "resume_id": resume_id
+    })
+    response = gemini_client.models.generate_content(
+        model=settings.gemini_model,
+        contents=EXTRACT_RESUME_PROMPT.format(text=resume.raw_text),
+    )
+
+    if response.text is None:
+        logger.error(f"Error processing resume", extra={"resume_id": resume_id})
+        return
+
+    clean = response.text.strip().strip("`").replace("```json", "").replace("```", "")
+
+    parsed_data = json.loads(clean)
     
+    async with db_conn() as aconn:
+        await aconn.execute("""
+                UPDATE resumes
+                SET parsed_data = %s,
+                updated_at = NOW()
+                WHERE id = %s
+            """,
+            (Json(parsed_data), resume.id,)
+        )
+        await aconn.commit()
+
+    logger.info(f"Updated resume with parsed data", extra={
+        "resume_id": resume_id,
+    })
+ 
 
 s3_client = boto3.client(
         "s3",
