@@ -1,10 +1,10 @@
 import json
 import random
+import tempfile
 import uuid
 
-from pathlib import Path
-
 import boto3
+import pymupdf
 
 from fastapi import status
 from google import genai
@@ -32,8 +32,18 @@ from .prompts import (
 )
 from .redis import publish
 from .settings import settings
+from .text_processor import TextPreprocessor
+
+
+s3_client = boto3.client(
+        "s3",
+        aws_access_key_id=settings.aws_access_key,
+        aws_secret_access_key=settings.aws_secret_key,
+        region_name=settings.aws_region,
+    )
 
 gemini_client = genai.Client(api_key=settings.gemini_api_key)
+
 
 def retry_with_exponential_backoff(
     retry: int,
@@ -60,12 +70,15 @@ def handle_retry(job, connection, type, value, traceback):
 
 
 @job(
-    "llm",
+    "default",
     connection=settings.redis_conn,
     retry=retry_with_exponential_backoff(3),
-    on_failure=handle_retry
+    # on_failure=handle_retry
 )
 async def process_and_save_resume(request_id: str, resume_id: uuid.UUID) -> None:
+    #-----------------------------------------------
+    # Find a way to inject request_id to all task 
+    #----------------------------------------------- 
     REQUEST_ID_CTX.set(request_id)
     async with db_conn() as aconn:
         async with aconn.cursor(row_factory=class_row(Resume)) as cur:
@@ -73,9 +86,11 @@ async def process_and_save_resume(request_id: str, resume_id: uuid.UUID) -> None
                 SELECT
                     resumes.id,
                     resumes.raw_text,
-                    resumes.parsed_data
+                    resumes.parsed_data,
+                    resumes.s3_url
                 FROM resumes
                 WHERE resumes.id = %s
+                AND resumes.parsed_data IS NULL
             """,
                 (resume_id,),
             )
@@ -84,12 +99,44 @@ async def process_and_save_resume(request_id: str, resume_id: uuid.UUID) -> None
     if resume is None:
         logger.error(f"No resume found", extra={"resume_id": resume_id})
         return
+    
+    raw_text = ""
+    response = s3_client.get_object(Bucket=settings.aws_bucket, Key=resume.s3_url)
+    streaming_body = response['Body']
 
-    if resume.parsed_data:
-        logger.info("Resume already parsed, skipping llm ingress", extra={
-            "resume_id": resume_id,
-        })
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=True) as temp_pdf:
+        for chunk in streaming_body.iter_chunks(chunk_size=64 * 1024):
+            temp_pdf.write(chunk)
+        
+        temp_pdf.flush()
+
+        logger.info(f"File spooled to disk at {temp_pdf.name}. Starting extraction....")
+        with pymupdf.open(temp_pdf.name) as doc:
+            raw_text = chr(12).join([page.get_text() for page in doc]) # type: ignore
+
+    raw_text = (
+        TextPreprocessor(raw_text)
+            .remove_extra_whitespace()
+            .normalize_unicode()
+            .remove_boilerplates()
+            .redact_pii()
+            .get_text()
+    )
+
+    if not raw_text:
+        logger.error(f"File is empty", extra={"resume_id": resume_id})
         return
+
+    async with db_conn() as aconn:
+        await aconn.execute("""
+                UPDATE resumes
+                SET raw_text = %s,
+                updated_at = NOW()
+                WHERE id = %s
+            """,
+            (raw_text, resume.id,)
+        )
+        await aconn.commit()
 
     logger.info(f"Extracting content in json...", extra={
         "resume_id": resume_id
@@ -104,7 +151,6 @@ async def process_and_save_resume(request_id: str, resume_id: uuid.UUID) -> None
         return
 
     clean = response.text.strip().strip("`").replace("```json", "").replace("```", "")
-
     parsed_data = json.loads(clean)
     
     async with db_conn() as aconn:
@@ -121,55 +167,6 @@ async def process_and_save_resume(request_id: str, resume_id: uuid.UUID) -> None
     logger.info(f"Updated resume with parsed data", extra={
         "resume_id": resume_id,
     })
- 
-
-s3_client = boto3.client(
-        "s3",
-        aws_access_key_id=settings.aws_access_key,
-        aws_secret_access_key=settings.aws_secret_key,
-        region_name=settings.aws_region,
-    )
-
-
-@job("default", connection=settings.redis_conn)
-async def upload_resume_to_s3(request_id:str, resume_id: uuid.UUID, file_path: Path) -> None:
-    REQUEST_ID_CTX.set(request_id)
-    logger.info("Starting S3 upload", extra={
-        "filename": file_path.name,
-        "resume_id": resume_id,
-    })
-    try:
-        s3_object_name = f"{resume_id}_{file_path.name}"
-        s3_client.upload_file(
-            str(file_path),
-            settings.aws_bucket,
-            s3_object_name,
-        )
-        s3_url = f"https://{settings.aws_bucket}.s3.{settings.aws_region}.amazonaws.com/{s3_object_name}"
-
-        logger.info("Uploaded to S3", extra={
-            "filename": file_path.name,
-            "resume_id": resume_id,
-        })
-
-        async with db_conn() as aconn:
-            await aconn.execute("""
-                    UPDATE resumes
-                    SET s3_url = %s,
-                    updated_at = NOW()
-                    WHERE id = %s
-                """,
-                (Json(s3_url), resume_id,)
-            )
-            await aconn.commit()
-
-            
-        file_path.unlink()
-        logger.info("[S3 Resume Upload]: Deleted local file after S3 upload", extra={
-            "file_path": file_path
-        })
-    except Exception as e:
-        logger.error("[S3 Resume Upload]: Failed to upload resume to S3", e)
 
 
 @job(
