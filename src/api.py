@@ -1,14 +1,14 @@
+#----------------------------------
+# Followed layered architecture
+#----------------------------------
 import json
 import uuid
 
-from datetime import datetime
 from dataclasses import dataclass
 
-import aiofiles
 import boto3
-import pymupdf
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
 from psycopg import sql
 from psycopg.rows import class_row
@@ -16,7 +16,6 @@ from rq.exceptions import NoSuchJobError
 from rq.job import Job
 
 from .deps import (
-    get_resume_upload_dir,
     get_db_connection,
     get_scraper_registry,
     verify_content_hash_header,
@@ -26,12 +25,10 @@ from .jobs import (
     ingress_llm,
     process_and_save_resume,
     scrape_job_details,
-    upload_resume_to_s3,
 )
 from .models import Resume
 from .settings import settings
 from .redis import async_redis
-from .text_processor import TextPreprocessor
 from .utils import hash_url
 
 
@@ -52,6 +49,9 @@ MAX_FILE_SIZE = 2 * 1024 * 1024  # 2MB
 CHUNK_SIZE = 1024 * 1024  # 1MB
 
 
+#----------------------------------------------------
+# Add retry with exponential backoff and jitter 
+#----------------------------------------------------
 def generate_presigned_url(s3_client, client_method: str, params: dict[str, str], expires_in: int):
     try:
         url = s3_client.generate_presigned_url(
@@ -74,12 +74,13 @@ class ResumeUploadSchema:
 
 @router.post("/resumes/upload/init")
 async def upload_resume(
-    # file: UploadFile,
     payload: ResumeUploadSchema,
     content_hash: str = Depends(verify_content_hash_header),
-    # resume_upload_dir=Depends(get_resume_upload_dir),
     db_conn=Depends(get_db_connection),
 ):
+    #----------------------------------------------------
+    # Move validations a step-up and away from controller
+    #----------------------------------------------------
     if not payload.filename or not payload.filename.strip():
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -97,41 +98,9 @@ async def upload_resume(
             status_code=status.HTTP_413_CONTENT_TOO_LARGE,
             detail="File size exceeds the maximum limit of 2MB.",
         )
-    
-    # content_buffer = await file.read()
-    
-    # with pymupdf.open(stream=content_buffer) as doc:
-    #     text = chr(12).join([page.get_text() for page in doc])  # type: ignore
-
-    # raw_text = (
-    #     TextPreprocessor(text)
-    #         .remove_extra_whitespace()
-    #         .normalize_unicode()
-    #         .remove_boilerplates()
-    #         .redact_pii()
-    #         .get_text()
-    # )
-
-    # if not raw_text:
-    #     raise HTTPException(
-    #         status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-    #         detail="File is empty.",
-    #     )
-
-    # ts = datetime.now().strftime("%Y%m%d%H%M%S%f")
-    # stem, sep, ext = file.filename.rpartition(".")
-    # timestamped_name = f"{payload.filename}-{ts}.pdf"
-
-    # destination_path = resume_upload_dir / timestamped_name
-
-    # async with aiofiles.open(destination_path, "wb") as out_file:
-    #     await out_file.write(content_buffer)
 
     resume = Resume(filename=payload.filename,)
-    
     resume.s3_url = f"resumes/{resume.id}-{payload.filename}"
-
-    # Update where s3_url is null and last_upload_presigned_url_generated_at exceeds the expiry time
 
     async with db_conn.cursor() as cur:
         await cur.execute(
@@ -147,12 +116,12 @@ async def upload_resume(
                     )
                     VALUES (%s, %s, %s, %s, NOW(), NOW())
                     ON CONFLICT (content_hash) DO UPDATE
-                    SET updated_at = NOW
-                    WHERE upload_status = 'pending'
+                    SET updated_at = NOW()
+                    WHERE resumes.upload_status = 'pending'
                     AND (
-                            last_upload_presigned_url_generated_at is NULL
+                            resumes.last_upload_presigned_url_generated_at is NULL
                             OR
-                            last_upload_presigned_url_generated_at < NOW() - INTERVAL '3 minutes'
+                            resumes.last_upload_presigned_url_generated_at < NOW() - INTERVAL '3 minutes'
                         )
                     RETURNING id;
                 """
@@ -181,7 +150,7 @@ async def upload_resume(
             "Key": resume.s3_url,
             "ContentType": payload.content_type,
         },
-        expires_in=180,
+        expires_in=180, # Set a config
     )
 
     async with db_conn as aconn:
@@ -196,132 +165,55 @@ async def upload_resume(
         )
 
     return {"id": resume.id, "upload_url": url}
-    
-    # logger.info(f"[POST: /resumes/upload]: Resume dispatched for LLM extraction", extra={
-    #     "resume_id": resume.id,
-    # })
-    # process_and_save_resume.delay(REQUEST_ID_CTX.get(), resume.id)  # type: ignore
-    # logger.info(f"[POST: /resumes/upload]: Resume dispatched for S3 uploads", extra={
-    #     "resume_id": resume.id,
-    # })
-    # upload_resume_to_s3.delay(REQUEST_ID_CTX.get(), resume.id, destination_path,)  # type: ignore
-
-    return {"message": "Resume uploaded and processing initiated", "resume_id": str(resume.id)}
 
 
-@router.patch("/resumes/{resume_id}")
+@dataclass
+class ResumeUploadCompleteSchema:
+    resume_id: str
+
+
+# @TODO: Create a dummy data in db and test this
+@router.post("/resumes/upload/complete")
 async def update_resume(
+    payload: ResumeUploadCompleteSchema,
     db_conn=Depends(get_db_connection),
 ):  
-    # content_buffer = await file.read()
-    
-    # with pymupdf.open(stream=content_buffer) as doc:
-    #     text = chr(12).join([page.get_text() for page in doc])  # type: ignore
-
-    # raw_text = (
-    #     TextPreprocessor(text)
-    #         .remove_extra_whitespace()
-    #         .normalize_unicode()
-    #         .remove_boilerplates()
-    #         .redact_pii()
-    #         .get_text()
-    # )
-
-    # if not raw_text:
-    #     raise HTTPException(
-    #         status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-    #         detail="File is empty.",
-    #     )
-
-    # ts = datetime.now().strftime("%Y%m%d%H%M%S%f")
-    # stem, sep, ext = file.filename.rpartition(".")
-    # timestamped_name = f"{payload.filename}-{ts}.pdf"
-
-    # destination_path = resume_upload_dir / timestamped_name
-
-    # async with aiofiles.open(destination_path, "wb") as out_file:
-    #     await out_file.write(content_buffer)
-
-    resume = Resume(filename=payload.filename,)
-    
-    resume.s3_url = f"resumes/{resume.id}-{payload.filename}"
-
-    # Update where s3_url is null and last_upload_presigned_url_generated_at exceeds the expiry time
-
-    async with db_conn.cursor() as cur:
-        await cur.execute(
-            sql.SQL(
-                """
-                    INSERT INTO ria.resumes (
-                        id,
-                        filename,
-                        content_hash,
-                        s3_url,
-                        created_at,
-                        updated_at
-                    )
-                    VALUES (%s, %s, %s, %s, NOW(), NOW())
-                    ON CONFLICT (content_hash) DO UPDATE
-                    SET updated_at = NOW
-                    WHERE upload_status = 'pending'
-                    AND (
-                            last_upload_presigned_url_generated_at is NULL
-                            OR
-                            last_upload_presigned_url_generated_at < NOW() - INTERVAL '3 minutes'
-                        )
-                    RETURNING id;
-                """
-            ),
-            (
-                resume.id,
-                resume.filename,
-                content_hash,
-                resume.s3_url,
-            ),
+    async with db_conn.cursor() as aconn:
+        await aconn.execute("""
+            SELECT
+                resumes.id,
+                resumes.parsed_data
+            FROM resumes
+            WHERE resumes.id = %s
+            AND resumes.upload_status = 'pending'
+            AND resumes.parsed_data IS NULL
+        """,
+            (payload.resume_id,),
         )
+        resume = await aconn.fetchone()
 
-        row = await cur.fetchone()
-
-    if row is None:
+    if resume is None:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="File has been previously uploaded, skipping processing",
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No resume found for id: {payload.resume_id}",
         )
-    
-    url = generate_presigned_url(
-        s3_client=s3_client,
-        client_method="put_object",
-        params={
-            "Bucket": settings.aws_bucket,
-            "Key": resume.s3_url,
-            "ContentType": payload.content_type,
-        },
-        expires_in=180,
-    )
 
     async with db_conn as aconn:
         await aconn.execute(
             query="""
                 UPDATE ria.resumes
-                SET last_upload_presigned_url_generated_at = NOW(),
+                SET upload_status = 'completed',
                     updated_at = NOW()
-                WHERE content_hash = %s;
+                WHERE id = %s;
             """,
-            params=(content_hash,)
+            params=(payload.resume_id,)
         )
-
-    return {"upload_url": url}
     
-    # logger.info(f"[POST: /resumes/upload]: Resume dispatched for LLM extraction", extra={
-    #     "resume_id": resume.id,
-    # })
-    # process_and_save_resume.delay(REQUEST_ID_CTX.get(), resume.id)  # type: ignore
-    # logger.info(f"[POST: /resumes/upload]: Resume dispatched for S3 uploads", extra={
-    #     "resume_id": resume.id,
-    # })
-    # upload_resume_to_s3.delay(REQUEST_ID_CTX.get(), resume.id, destination_path,)  # type: ignore
+    process_and_save_resume.delay( # type: ignore
+        REQUEST_ID_CTX.get(),
+        payload.resume_id,
+    )
 
-    return {"message": "Resume uploaded and processing initiated", "resume_id": str(resume.id)}
 
 @dataclass
 class ResumeAnalyzeSchema:
