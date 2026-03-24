@@ -83,6 +83,20 @@ async def init_db():
                 ALTER TABLE ria.resumes ADD COLUMN IF NOT EXISTS last_upload_presigned_url_generated_at TIMESTAMP;
             """
         ),
+        sql.SQL(
+            """
+                DO $$ BEGIN
+                    CREATE TYPE resume_upload_status AS ENUM('pending', 'completed');
+                EXCEPTION
+                    WHEN duplicate_object THEN null;
+                END $$;
+            """
+        ),
+        sql.SQL(
+            """
+                ALTER TABLE ria.resumes ADD COLUMN IF NOT EXISTS upload_status resume_upload_status DEFAULT 'pending';
+            """
+        ),
     ]
 
     async with db_conn() as conn:
