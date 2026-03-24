@@ -2,7 +2,6 @@ import time
 import uuid
 
 from contextlib import asynccontextmanager
-from pathlib import Path
 
 from fastapi import Depends, FastAPI, Request, status
 from fastapi.middleware.gzip import GZipMiddleware
@@ -18,10 +17,6 @@ from .settings import settings
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    project_root = Path(__file__).resolve().parents[1]
-    resume_upload_dir = project_root / "resumes"
-    app.state.resume_upload_dir = resume_upload_dir
-
     logger.info("Initializing Database...")
     await init_db()
     logger.info("Database initialization completed")

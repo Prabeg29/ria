@@ -1,5 +1,3 @@
-from pathlib import Path
-
 from fastapi import Header, HTTPException, Request, status
 
 from .database import db_conn
@@ -15,10 +13,6 @@ def verify_content_hash_header(
             detail="Missing required header: X-Content-Hash",
         )
     return x_content_hash.strip()
-
-
-def get_resume_upload_dir(request: Request) -> Path:
-    return request.app.state.resume_upload_dir
 
 
 async def get_db_connection():
