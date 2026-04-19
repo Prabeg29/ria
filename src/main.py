@@ -35,6 +35,9 @@ app = FastAPI(
 app.add_middleware(GZipMiddleware, minimum_size=1000, compresslevel=5)
 
 
+#--------------------------------------------------
+# Add open telemetry, prometheus
+#--------------------------------------------------
 @app.middleware("http")
 async def add_request_id(request: Request, call_next):
     req_id = request.headers.get("X-REQUEST-ID") or str(uuid.uuid4())
@@ -61,6 +64,9 @@ async def add_request_id(request: Request, call_next):
     
 app.include_router(router=router)
 
+#--------------------------------------------------
+# Add health check for redis
+#--------------------------------------------------
 @app.get("/health", status_code=status.HTTP_200_OK)
 async def health(db_conn=Depends(get_db_connection)):
     await db_conn.execute("SELECT 1")
@@ -69,7 +75,6 @@ async def health(db_conn=Depends(get_db_connection)):
     return {
         "status": "healthy",
         "database": db_status,
-        "resume_dir": str(app.state.resume_upload_dir.exists())
     }
 
 @app.get("/", status_code=status.HTTP_200_OK)
@@ -81,7 +86,7 @@ def root():
     }
 
 @app.exception_handler(Exception)
-async def generic_exception_handler(request: Request, e: Exception):
+async def generic_exception_handler(_, e: Exception):
     logger.critical("Unhandled exception", extra={
         "exception": e,
     })

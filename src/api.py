@@ -1,13 +1,9 @@
-#----------------------------------
-# Followed layered architecture
-#----------------------------------
 import json
 import uuid
 
-from dataclasses import dataclass
-
 import boto3
 
+from botocore.config import Config
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
 from psycopg import sql
@@ -27,6 +23,11 @@ from .jobs import (
     scrape_job_details,
 )
 from .models import Resume
+from .schemas import (
+    ResumeAnalyzeSchema,
+    ResumeUploadSchema,
+    ResumeUploadCompleteSchema,
+)
 from .settings import settings
 from .redis import async_redis
 from .utils import hash_url
@@ -39,37 +40,13 @@ s3_client = boto3.client(
     aws_access_key_id=settings.aws_access_key,
     aws_secret_access_key=settings.aws_secret_key,
     region_name=settings.aws_region,
+    config=Config(
+        retries={
+            "total_max_attempts": 3,
+            "mode": "adaptive",
+        }
+    )
 )
-
-VALID_FILE_FORMATS = {
-    "application/pdf",
-    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-}
-MAX_FILE_SIZE = 2 * 1024 * 1024  # 2MB
-CHUNK_SIZE = 1024 * 1024  # 1MB
-
-
-#----------------------------------------------------
-# Add retry with exponential backoff and jitter 
-#----------------------------------------------------
-def generate_presigned_url(s3_client, client_method: str, params: dict[str, str], expires_in: int):
-    try:
-        url = s3_client.generate_presigned_url(
-            ClientMethod=client_method,
-            Params=params,
-            ExpiresIn=expires_in
-        )
-
-        return url
-    except Exception:
-        raise
-
-
-@dataclass
-class ResumeUploadSchema:
-    filename: str
-    size: int
-    content_type: str
 
 
 @router.post("/resumes/upload/init")
@@ -78,27 +55,6 @@ async def upload_resume(
     content_hash: str = Depends(verify_content_hash_header),
     db_conn=Depends(get_db_connection),
 ):
-    #----------------------------------------------------
-    # Move validations a step-up and away from controller
-    #----------------------------------------------------
-    if not payload.filename or not payload.filename.strip():
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail="Filename is required",
-        )
-
-    if payload.content_type not in VALID_FILE_FORMATS:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail="Invalid file format. Only PDF and DOCX are allowed.",
-        )
-
-    if payload.size and payload.size > MAX_FILE_SIZE:
-        raise HTTPException(
-            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
-            detail="File size exceeds the maximum limit of 2MB.",
-        )
-
     resume = Resume(filename=payload.filename,)
     resume.s3_url = f"resumes/{resume.id}-{payload.filename}"
 
@@ -141,16 +97,18 @@ async def upload_resume(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="File has been previously uploaded, skipping processing",
         )
-    
-    url = generate_presigned_url(
-        s3_client=s3_client,
-        client_method="put_object",
-        params={
-            "Bucket": settings.aws_bucket,
-            "Key": resume.s3_url,
-            "ContentType": payload.content_type,
+
+    url = s3_client.generate_presigned_post(
+        Bucket=settings.aws_bucket,
+        Key=resume.s3_url,
+        Fields={
+            "Content-Type": payload.content_type
         },
-        expires_in=180, # Set a config
+        Conditions=[
+            ["eq", "$Content-Type", payload.content_type],
+            ["content-length-range", 50, 1024 * 1024]
+        ],
+        ExpiresIn=180
     )
 
     async with db_conn as aconn:
@@ -167,20 +125,14 @@ async def upload_resume(
     return {"id": resume.id, "upload_url": url}
 
 
-@dataclass
-class ResumeUploadCompleteSchema:
-    resume_id: str
-
-
-# @TODO: Create a dummy data in db and test this
 @router.post("/resumes/upload/complete")
 async def update_resume(
     payload: ResumeUploadCompleteSchema,
     db_conn=Depends(get_db_connection),
-):  
+):
     async with db_conn.cursor() as aconn:
         await aconn.execute("""
-            SELECT
+            SELECT FOR UPDATE
                 resumes.id,
                 resumes.parsed_data
             FROM resumes
@@ -209,18 +161,13 @@ async def update_resume(
             params=(payload.resume_id,)
         )
     
-    process_and_save_resume.delay( # type: ignore
-        REQUEST_ID_CTX.get(),
-        payload.resume_id,
-    )
+    process_and_save_resume.delay(payload.resume_id) # type: ignore
 
 
-@dataclass
-class ResumeAnalyzeSchema:
-    job_url: str
-
-
-@router.post("/resumes/{resume_id}/analyze", status_code=status.HTTP_202_ACCEPTED)
+@router.post(
+    "/resumes/{resume_id}/analyze",
+    status_code=status.HTTP_202_ACCEPTED
+)
 async def analyze_resume(
     resume_id: str,
     payload: ResumeAnalyzeSchema,
@@ -241,7 +188,10 @@ async def analyze_resume(
         resume = await cur.fetchone()
 
     if resume is None:
-        raise Exception(f"No resume found with ID {resume_id}.")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No resume found with ID {resume_id}."
+        )
     
     job_scraper = scraper_registry.resolve(payload.job_url)
     normalized_url = job_scraper.normalize(payload.job_url)
