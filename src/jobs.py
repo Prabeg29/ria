@@ -1,9 +1,7 @@
 import json
 import random
-import tempfile
 import uuid
 
-import boto3
 import pymupdf
 
 from fastapi import status
@@ -14,6 +12,7 @@ from psycopg.rows import class_row
 from psycopg.types.json import Json
 from rq import Retry
 from rq.decorators import job
+from rq.queue import Queue
 from tenacity import (
     before_sleep_log,
     retry,
@@ -33,31 +32,33 @@ from .prompts import (
 from .redis import publish
 from .settings import settings
 from .text_processor import TextPreprocessor
+from .utils import s3_client
 
-
-s3_client = boto3.client(
-        "s3",
-        aws_access_key_id=settings.aws_access_key,
-        aws_secret_access_key=settings.aws_secret_key,
-        region_name=settings.aws_region,
-    )
 
 gemini_client = genai.Client(api_key=settings.gemini_api_key)
 
 
+class CustomQueue(Queue):
+    def enqueue_call(self, f, *args, **kwargs):
+        kwargs["meta"] = {}
+        kwargs["meta"]["request_id"] = REQUEST_ID_CTX.get()
+
+        return super().enqueue_call(f, *args, **kwargs)
+
+
 def retry_with_exponential_backoff(
     retry: int,
+    *,
     initial: float = 1,
     max_value: float = 300,
     exp_base: float = 2,
-    jitter: float = 1
-
+    jitter: float = 1,
 ) -> Retry:
     intervals = []
     for attempt in range(retry):
         jitter = random.uniform(0, jitter)
         try:
-            exp = exp_base ** attempt
+            exp = exp_base**attempt
             result = initial * exp + jitter
         except OverflowError:
             result = max_value
@@ -65,24 +66,26 @@ def retry_with_exponential_backoff(
     return Retry(retry, intervals)
 
 
+# ----------------------------------------------------
+# Exit retry for non-transient exceptions
+# ----------------------------------------------------
 def handle_retry(job, connection, type, value, traceback):
+    logger.info(job)
     pass
 
 
 @job(
     "default",
     connection=settings.redis_conn,
-    retry=retry_with_exponential_backoff(3),
-    # on_failure=handle_retry
+    queue_class=CustomQueue,
+    retry=retry_with_exponential_backoff(3, initial=30),
+    on_failure=handle_retry,
 )
-async def process_and_save_resume(request_id: str, resume_id: uuid.UUID) -> None:
-    #-----------------------------------------------
-    # Find a way to inject request_id to all task 
-    #----------------------------------------------- 
-    REQUEST_ID_CTX.set(request_id)
+async def process_and_save_resume(resume_id: uuid.UUID) -> None:
     async with db_conn() as aconn:
         async with aconn.cursor(row_factory=class_row(Resume)) as cur:
-            await cur.execute("""
+            await cur.execute(
+                """
                 SELECT
                     resumes.id,
                     resumes.raw_text,
@@ -97,76 +100,91 @@ async def process_and_save_resume(request_id: str, resume_id: uuid.UUID) -> None
             resume = await cur.fetchone()
 
     if resume is None:
-        logger.error(f"No resume found", extra={"resume_id": resume_id})
+        logger.error(
+            f"[process_and_save_resume]: No resume found",
+            extra={"resume_id": resume_id},
+        )
         return
-    
-    raw_text = ""
-    response = s3_client.get_object(Bucket=settings.aws_bucket, Key=resume.s3_url)
-    streaming_body = response['Body']
 
-    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=True) as temp_pdf:
-        for chunk in streaming_body.iter_chunks(chunk_size=64 * 1024):
-            temp_pdf.write(chunk)
-        
-        temp_pdf.flush()
+    if resume.raw_text is None:
+        raw_text = ""
+        response = s3_client.get_object(Bucket=settings.aws_bucket, Key=resume.s3_url)
+        file_content = response["Body"].read()
 
-        logger.info(f"File spooled to disk at {temp_pdf.name}. Starting extraction....")
-        with pymupdf.open(temp_pdf.name) as doc:
-            raw_text = chr(12).join([page.get_text() for page in doc]) # type: ignore
 
-    raw_text = (
-        TextPreprocessor(raw_text)
+        with pymupdf.open(stream=file_content, filetype="pdf") as doc:
+            raw_text = chr(12).join([page.get_text() for page in doc])  # type: ignore
+
+        raw_text = (
+            TextPreprocessor(raw_text)
             .remove_extra_whitespace()
             .normalize_unicode()
             .remove_boilerplates()
             .redact_pii()
             .get_text()
-    )
-
-    if not raw_text:
-        logger.error(f"File is empty", extra={"resume_id": resume_id})
-        return
-
-    async with db_conn() as aconn:
-        await aconn.execute("""
-                UPDATE resumes
-                SET raw_text = %s,
-                updated_at = NOW()
-                WHERE id = %s
-            """,
-            (raw_text, resume.id,)
         )
-        await aconn.commit()
 
-    logger.info(f"Extracting content in json...", extra={
-        "resume_id": resume_id
-    })
+        if not raw_text:
+            logger.error(
+                f"[process_and_save_resume]: File is empty",
+                extra={"resume_id": resume_id},
+            )
+            return
+
+        async with db_conn() as aconn:
+            await aconn.execute(
+                """
+                    UPDATE resumes
+                    SET raw_text = %s,
+                    updated_at = NOW()
+                    WHERE id = %s
+                """,
+                (
+                    raw_text,
+                    resume.id,
+                ),
+            )
+
+        resume.raw_text = raw_text
+
+    logger.info(
+        f"[process_and_save_resume]: Extracting content in json...",
+        extra={"resume_id": resume_id},
+    )
     response = gemini_client.models.generate_content(
         model=settings.gemini_model,
         contents=EXTRACT_RESUME_PROMPT.format(text=resume.raw_text),
     )
 
     if response.text is None:
-        logger.error(f"Error processing resume", extra={"resume_id": resume_id})
+        logger.error(
+            f"[process_and_save_resume]: Error processing resume",
+            extra={"resume_id": resume_id},
+        )
         return
 
     clean = response.text.strip().strip("`").replace("```json", "").replace("```", "")
     parsed_data = json.loads(clean)
-    
+
     async with db_conn() as aconn:
-        await aconn.execute("""
+        await aconn.execute(
+            """
                 UPDATE resumes
                 SET parsed_data = %s,
                 updated_at = NOW()
                 WHERE id = %s
             """,
-            (Json(parsed_data), resume.id,)
+            (
+                Json(parsed_data),
+                resume.id,
+            ),
         )
         await aconn.commit()
 
-    logger.info(f"Updated resume with parsed data", extra={
-        "resume_id": resume_id,
-    })
+    logger.info(
+        f"[process_and_save_resume]: Updated resume with parsed data",
+        extra={"resume_id": resume_id,},
+    )
 
 
 @job(
@@ -175,17 +193,13 @@ async def process_and_save_resume(request_id: str, resume_id: uuid.UUID) -> None
     retry=Retry(max=3, interval=[1, 30, 60]),
 )
 async def scrape_job_details(
-    request_id: str,
-    job_scraper: JobScraper,
-    normalized_url: str,
-    url_hash: str
+    request_id: str, job_scraper: JobScraper, normalized_url: str, url_hash: str
 ) -> None:
     REQUEST_ID_CTX.set(request_id)
 
-    await publish(request_id, "status", {
-        "status": "scraping",
-        "message": "Accessing job url..."
-    })
+    await publish(
+        request_id, "status", {"status": "scraping", "message": "Accessing job url..."}
+    )
 
     async with db_conn() as aconn:
         await aconn.execute(
@@ -195,7 +209,7 @@ async def scrape_job_details(
                     updated_at = NOW()
                 WHERE url_hash = %s;
             """,
-            params=(url_hash,)
+            params=(url_hash,),
         )
 
     async with async_playwright() as p:
@@ -204,17 +218,16 @@ async def scrape_job_details(
         )
         try:
             page = await browser.new_page()
-        
-            await page.route("**/*.{png,jpg,jpeg,gif,css,woff2}", lambda route: route.abort())
+
+            await page.route(
+                "**/*.{png,jpg,jpeg,gif,css,woff2}", lambda route: route.abort()
+            )
             resp = await page.goto(
                 url=normalized_url,
                 wait_until="domcontentloaded",
             )
-            
-            if (
-                resp and 
-                resp.status == status.HTTP_404_NOT_FOUND
-            ):
+
+            if resp and resp.status == status.HTTP_404_NOT_FOUND:
                 async with db_conn() as aconn:
                     await aconn.execute(
                         query="""
@@ -225,17 +238,18 @@ async def scrape_job_details(
                                 updated_at = NOW()
                             WHERE url_hash = %s;
                         """,
-                        params=(url_hash,)
+                        params=(url_hash,),
                     )
-                await publish(request_id, "status", {
-                    "status": "scraping",
-                    "message": "Job not found"
-                })
+                await publish(
+                    request_id,
+                    "status",
+                    {"status": "scraping", "message": "Job not found"},
+                )
 
                 return
-            
+
             job_data = await job_scraper.extract(page)
-            
+
             async with db_conn() as aconn:
                 await aconn.execute(
                     query="""
@@ -246,7 +260,10 @@ async def scrape_job_details(
                             updated_at = NOW()
                         WHERE url_hash = %s;
                     """,
-                    params=(Json(job_data), url_hash,)
+                    params=(
+                        Json(job_data),
+                        url_hash,
+                    ),
                 )
         except Exception:
             logger.info(
@@ -255,7 +272,7 @@ async def scrape_job_details(
                 extra={
                     "normalized_job_url": normalized_url,
                     "url_hash": url_hash,
-                }
+                },
             )
             async with db_conn() as aconn:
                 await aconn.execute(
@@ -266,7 +283,7 @@ async def scrape_job_details(
                             updated_at = NOW()
                         WHERE url_hash = %s;
                     """,
-                    params=(url_hash,)
+                    params=(url_hash,),
                 )
             raise
         finally:
@@ -276,7 +293,7 @@ async def scrape_job_details(
 def is_retryable_error(e: Exception) -> bool:
     if isinstance(e, ServerError):
         return True
-    
+
     if isinstance(e, ClientError):
         if e.code == 429:
             return True
@@ -287,15 +304,14 @@ def is_retryable_error(e: Exception) -> bool:
     retry=retry_if_result(is_retryable_error),
     stop=stop_after_attempt(5),
     wait=wait_exponential(multiplier=2, min=4, max=60),
-    before_sleep=before_sleep_log(logger, 40)
+    before_sleep=before_sleep_log(logger, 40),
 )
 async def ingest_llm(resume_text: str, job_data):
     return await gemini_client.aio.models.generate_content_stream(
         model=settings.gemini_model,
         contents=ANALYZE_RESUME_AGAINST_JOB_PROMPT.format(
-            resume_raw_text=resume_text,
-            job=job_data
-        )
+            resume_raw_text=resume_text, job=job_data
+        ),
     )
 
 
@@ -304,29 +320,25 @@ async def ingest_llm(resume_text: str, job_data):
     connection=settings.redis_conn,
     retry=Retry(max=3, interval=[1, 30, 60]),
 )
-async def ingress_llm(
-    request_id: str,
-    resume_text: str,
-    url_hash: str
-):
+async def ingress_llm(request_id: str, resume_text: str, url_hash: str):
     REQUEST_ID_CTX.set(request_id)
 
     logger.info(
         "[Ingress LLM] Processing",
         extra={
             "url_hash": url_hash,
-        }
+        },
     )
 
-    await publish(request_id, "status", {
-        "status": "analyzing",
-        "message": "Reasoning with AI"
-    })
+    await publish(
+        request_id, "status", {"status": "analyzing", "message": "Reasoning with AI"}
+    )
 
     try:
         async with db_conn() as aconn:
             async with aconn.cursor(row_factory=class_row(ScrapedJob)) as cur:
-                await cur.execute("""
+                await cur.execute(
+                    """
                     SELECT
                         scraped_jobs.id,
                         scraped_jobs.status,
@@ -342,30 +354,28 @@ async def ingress_llm(
                     (url_hash,),
                 )
                 scraped_job = await cur.fetchone()
-        
+
         if scraped_job is None:
             logger.info(
                 "[Ingress LLM] No job found",
                 extra={
                     "url_hash": url_hash,
-                }
+                },
             )
-            await publish(request_id, "done", {"status": "complete"}) 
+            await publish(request_id, "done", {"status": "complete"})
             return
-            
 
         response_stream = await ingest_llm(
-            resume_text=resume_text,
-            job_data=scraped_job.scraped_data
+            resume_text=resume_text, job_data=scraped_job.scraped_data
         )
-            
+
         async for chunk in response_stream:
             if chunk.text:
                 await publish(request_id, "delta", {"text": chunk.text})
 
-        await publish(request_id, "done", {"status": "complete"}) 
+        await publish(request_id, "done", {"status": "complete"})
     except Exception:
-        logger.error("[Ingress LLM]: Job failed", exc_info=True, extra={
-            "url_hash": url_hash
-        })
-        await publish(request_id, "done", {"status": "failed"}) 
+        logger.error(
+            "[Ingress LLM]: Job failed", exc_info=True, extra={"url_hash": url_hash}
+        )
+        await publish(request_id, "done", {"status": "failed"})
