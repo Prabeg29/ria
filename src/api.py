@@ -4,6 +4,7 @@ import uuid
 import boto3
 
 from botocore.config import Config
+from botocore.exceptions import ClientError
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
 from psycopg import sql
@@ -130,38 +131,75 @@ async def update_resume(
     payload: ResumeUploadCompleteSchema,
     db_conn=Depends(get_db_connection),
 ):
-    async with db_conn.cursor() as aconn:
-        await aconn.execute("""
-            SELECT FOR UPDATE
-                resumes.id,
-                resumes.parsed_data
-            FROM resumes
-            WHERE resumes.id = %s
-            AND resumes.upload_status = 'pending'
-            AND resumes.parsed_data IS NULL
-        """,
-            (payload.resume_id,),
-        )
-        resume = await aconn.fetchone()
+    lock_key = f"resume:complete:{payload.resume_id}"
+    acquired = settings.redis_conn.set(lock_key, 1, ex=30, nx=True)
 
-    if resume is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"No resume found for id: {payload.resume_id}",
-        )
-
-    async with db_conn as aconn:
-        await aconn.execute(
-            query="""
-                UPDATE ria.resumes
-                SET upload_status = 'completed',
-                    updated_at = NOW()
-                WHERE id = %s;
+    try:
+        if not acquired:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Upload completion already in progress for this resume.",
+            )
+        
+        async with db_conn.cursor() as aconn:
+            await aconn.execute("""
+                SELECT
+                    resumes.id,
+                    resumes.s3_url
+                FROM resumes
+                WHERE resumes.id = %s
+                AND resumes.upload_status = 'pending'
+                AND resumes.parsed_data IS NULL
             """,
-            params=(payload.resume_id,)
-        )
+                (payload.resume_id,),
+            )
+            resume = await aconn.fetchone()
+
+        if resume is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"No resume found for id: {payload.resume_id}",
+            )
+
+        try:
+            s3_client.head_object(Bucket=settings.aws_bucket, Key=resume["s3_url"])
+        except ClientError as exc:
+            error_code = exc.response["Error"]["Code"]
+            if error_code in ("404", "NoSuchKey"):
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="File not found in S3 — the upload may not have completed.",
+                )
+
+        async with db_conn.cursor() as cur:
+            await cur.execute(
+                query="""
+                    UPDATE ria.resumes
+                    SET upload_status = 'completed',
+                        updated_at = NOW()
+                    WHERE id = %s
+                    AND resumes.upload_status='pending'
+                    RETURNING id;
+                """,
+                params=(payload.resume_id,)
+            )
+
+            updated = await cur.fetchone()
+
+        if updated is None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Resume was already marked as completed.",
+            )
+        
+        process_and_save_resume.delay(payload.resume_id) # type: ignore
+    finally:
+        settings.redis_conn.delete(lock_key)
     
-    process_and_save_resume.delay(payload.resume_id) # type: ignore
+    """
+    See long polling vs sse 
+    """
+    return {"message": "Resume sent for LLM parsing"}
 
 
 @router.post(
