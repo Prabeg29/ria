@@ -1,9 +1,6 @@
 import json
 import uuid
 
-import boto3
-
-from botocore.config import Config
 from botocore.exceptions import ClientError
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
@@ -26,37 +23,49 @@ from .jobs import (
 from .models import Resume
 from .schemas import (
     ResumeAnalyzeSchema,
-    ResumeUploadSchema,
+    ResumeUploadPayload,
     ResumeUploadCompleteSchema,
+    ResumeUploadInitResponse,
 )
 from .settings import settings
 from .redis import async_redis
-from .utils import hash_url
+from .utils import hash_url, s3_client
 
 
 router = APIRouter(prefix="")
 
-s3_client = boto3.client(
-    "s3",
-    aws_access_key_id=settings.aws_access_key,
-    aws_secret_access_key=settings.aws_secret_key,
-    region_name=settings.aws_region,
-    config=Config(
-        retries={
-            "total_max_attempts": 3,
-            "mode": "adaptive",
-        }
-    )
+
+@router.post(
+    "/resumes/upload/init",
+    response_model=ResumeUploadInitResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Initiates a resume upload by creating a record and generating an S3 URL.",
+    description="""Registers the resume metadata in the database using an upsert strategy on the
+    content hash. If the resume already exists and is not in a 'pending' state, or
+    if a presigned URL was generated recently, the request is rejected to prevent
+    duplicates."""
 )
-
-
-@router.post("/resumes/upload/init")
 async def upload_resume(
-    payload: ResumeUploadSchema,
+    payload: ResumeUploadPayload,
     content_hash: str = Depends(verify_content_hash_header),
     db_conn=Depends(get_db_connection),
 ):
-    resume = Resume(filename=payload.filename,)
+    """
+    Args:
+        payload: The resume metadata including filename and content type.
+        content_hash: The SHA-256 hash of the file content from the header.
+        db_conn: The asynchronous database connection.
+
+    Returns:
+        A dictionary containing the resume ID and the S3 presigned POST URL.
+
+    Raises:
+        HTTPException: If the file has been previously uploaded or if an upload
+            is already in progress for this content hash.
+    """
+    resume = Resume(
+        filename=payload.filename,
+    )
     resume.s3_url = f"resumes/{resume.id}-{payload.filename}"
 
     async with db_conn.cursor() as cur:
@@ -80,7 +89,7 @@ async def upload_resume(
                             OR
                             resumes.last_upload_presigned_url_generated_at < NOW() - INTERVAL '3 minutes'
                         )
-                    RETURNING id;
+                    RETURNING id, s3_url;
                 """
             ),
             (
@@ -101,29 +110,26 @@ async def upload_resume(
 
     url = s3_client.generate_presigned_post(
         Bucket=settings.aws_bucket,
-        Key=resume.s3_url,
-        Fields={
-            "Content-Type": payload.content_type
-        },
+        Key=row[1],
+        Fields={"Content-Type": payload.content_type},
         Conditions=[
             ["eq", "$Content-Type", payload.content_type],
-            ["content-length-range", 50, 1024 * 1024]
+            ["content-length-range", 50, 1024 * 1024],
         ],
-        ExpiresIn=180
+        ExpiresIn=settings.aws_s3_presigned_url_expiresin,
     )
 
-    async with db_conn as aconn:
-        await aconn.execute(
-            query="""
-                UPDATE ria.resumes
-                SET last_upload_presigned_url_generated_at = NOW(),
-                    updated_at = NOW()
-                WHERE content_hash = %s;
-            """,
-            params=(content_hash,)
-        )
+    await db_conn.execute(
+        query="""
+            UPDATE ria.resumes
+            SET last_upload_presigned_url_generated_at = NOW(),
+                updated_at = NOW()
+            WHERE content_hash = %s;
+        """,
+        params=(content_hash,),
+    )
 
-    return {"id": resume.id, "upload_url": url}
+    return ResumeUploadInitResponse(id=row[0], upload_url=url)
 
 
 @router.post("/resumes/upload/complete")
@@ -140,9 +146,10 @@ async def update_resume(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                 detail="Upload completion already in progress for this resume.",
             )
-        
+
         async with db_conn.cursor() as aconn:
-            await aconn.execute("""
+            await aconn.execute(
+                """
                 SELECT
                     resumes.id,
                     resumes.s3_url
@@ -162,7 +169,7 @@ async def update_resume(
             )
 
         try:
-            s3_client.head_object(Bucket=settings.aws_bucket, Key=resume["s3_url"])
+            s3_client.head_object(Bucket=settings.aws_bucket, Key=resume[1])
         except ClientError as exc:
             error_code = exc.response["Error"]["Code"]
             if error_code in ("404", "NoSuchKey"):
@@ -181,7 +188,7 @@ async def update_resume(
                     AND resumes.upload_status='pending'
                     RETURNING id;
                 """,
-                params=(payload.resume_id,)
+                params=(payload.resume_id,),
             )
 
             updated = await cur.fetchone()
@@ -191,29 +198,27 @@ async def update_resume(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="Resume was already marked as completed.",
             )
-        
-        process_and_save_resume.delay(payload.resume_id) # type: ignore
+
+        process_and_save_resume.delay(payload.resume_id)  # type: ignore
     finally:
         settings.redis_conn.delete(lock_key)
-    
+
     """
     See long polling vs sse 
     """
     return {"message": "Resume sent for LLM parsing"}
 
 
-@router.post(
-    "/resumes/{resume_id}/analyze",
-    status_code=status.HTTP_202_ACCEPTED
-)
+@router.post("/resumes/{resume_id}/analyze", status_code=status.HTTP_202_ACCEPTED)
 async def analyze_resume(
     resume_id: str,
     payload: ResumeAnalyzeSchema,
     db_conn=Depends(get_db_connection),
-    scraper_registry=Depends(get_scraper_registry)
+    scraper_registry=Depends(get_scraper_registry),
 ):
     async with db_conn.cursor(row_factory=class_row(Resume)) as cur:
-        await cur.execute("""
+        await cur.execute(
+            """
                 SELECT
                     resumes.id,
                     resumes.raw_text
@@ -221,16 +226,16 @@ async def analyze_resume(
                 WHERE resumes.id = %s
             """,
             (resume_id,),
-            )
-            
+        )
+
         resume = await cur.fetchone()
 
     if resume is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"No resume found with ID {resume_id}."
+            detail=f"No resume found with ID {resume_id}.",
         )
-    
+
     job_scraper = scraper_registry.resolve(payload.job_url)
     normalized_url = job_scraper.normalize(payload.job_url)
     url_hash = hash_url(normalized_url)
@@ -254,8 +259,9 @@ async def analyze_resume(
                     AND scraped_jobs.is_archived = false
                     OR scraped_jobs.status NOT IN ('queued', 'scraping')
                 RETURNING id;
-            """, 
-        params=(str(uuid.uuid4()), normalized_url, url_hash))
+            """,
+            params=(str(uuid.uuid4()), normalized_url, url_hash),
+        )
 
         row = await cur.fetchone()
 
@@ -268,10 +274,10 @@ async def analyze_resume(
                 "raw_job_url": payload.job_url,
                 "normalized_job_url": normalized_url,
                 "url_hash": url_hash,
-            }
+            },
         )
 
-        scrape_job = scrape_job_details.delay( # type: ignore
+        scrape_job = scrape_job_details.delay(  # type: ignore
             REQUEST_ID_CTX.get(),
             job_scraper,
             normalized_url,
@@ -290,14 +296,11 @@ async def analyze_resume(
             "raw_job_url": payload.job_url,
             "normalized_job_url": normalized_url,
             "url_hash": url_hash,
-        }
+        },
     )
 
-    ingress_llm.delay( # type: ignore
-        REQUEST_ID_CTX.get(),
-        resume.raw_text,
-        url_hash,
-        depends_on=scrape_job
+    ingress_llm.delay(  # type: ignore
+        REQUEST_ID_CTX.get(), resume.raw_text, url_hash, depends_on=scrape_job
     )
 
     return {"status": "queued", "job_id": REQUEST_ID_CTX.get()}
@@ -334,7 +337,7 @@ async def analysis_generator(job_id: str):
 
             yield build_sse_event(payload, event_type)
 
-            if event_type == "done":                    
+            if event_type == "done":
                 return
 
 
@@ -346,5 +349,5 @@ async def stream_job_analysis(job_id: str):
         headers={
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
-        }
+        },
     )
