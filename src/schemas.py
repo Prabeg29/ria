@@ -1,37 +1,25 @@
 from dataclasses import dataclass
+from enum import Enum
+from uuid import UUID
 
-from fastapi import HTTPException, status
+from pydantic import BaseModel, Field
 
 
-VALID_FILE_FORMATS = {
-    "application/pdf",
-    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+VALID_FILE_SIZES = {
+    "min": 50, # 50KB
+    "max": 1024 * 1024, # 1MB
 }
-MAX_FILE_SIZE = 2 * 1024 * 1024  # 2MB
 
 
-@dataclass
-class ResumeUploadSchema:
-    filename: str
-    size: int
-    content_type: str
+class MimeType(str, Enum):
+    PDF = "application/pdf"
+    DOCX = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 
-    def __post_init__(self):
-        if not self.filename or not self.filename.strip():
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail="Filename is required",
-            )
-        if self.content_type not in VALID_FILE_FORMATS:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail="Invalid file format. Only PDF and DOCX are allowed.",
-            )
-        if self.size and self.size > MAX_FILE_SIZE:
-            raise HTTPException(
-                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                detail="File size exceeds the maximum limit of 2MB.",
-            )
+
+class ResumeUploadPayload(BaseModel):
+    filename: str = Field(min_length=1)
+    size: int = Field(ge=50, le=1024*1024)
+    content_type: MimeType
 
 
 @dataclass
@@ -42,3 +30,13 @@ class ResumeUploadCompleteSchema:
 @dataclass
 class ResumeAnalyzeSchema:
     job_url: str
+
+
+class S3PresignedPost(BaseModel):
+    url: str
+    fields: dict[str, str]
+
+
+class ResumeUploadInitResponse(BaseModel):
+    id: UUID
+    upload_url: S3PresignedPost
