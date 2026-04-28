@@ -18,12 +18,11 @@ class MimeType(str, Enum):
 
 class ResumeUploadPayload(BaseModel):
     filename: str = Field(min_length=1)
-    size: int = Field(ge=50, le=1024*1024)
+    size: int = Field(ge=VALID_FILE_SIZES["min"], le=VALID_FILE_SIZES["max"],)
     content_type: MimeType
 
 
-@dataclass
-class ResumeUploadCompleteSchema:
+class ResumeUploadCompletePayload(BaseModel):
     resume_id: str
 
 

@@ -24,7 +24,7 @@ from .models import Resume
 from .schemas import (
     ResumeAnalyzeSchema,
     ResumeUploadPayload,
-    ResumeUploadCompleteSchema,
+    ResumeUploadCompletePayload,
     ResumeUploadInitResponse,
 )
 from .settings import settings
@@ -134,74 +134,67 @@ async def upload_resume(
 
 @router.post("/resumes/upload/complete")
 async def update_resume(
-    payload: ResumeUploadCompleteSchema,
+    payload: ResumeUploadCompletePayload,
     db_conn=Depends(get_db_connection),
 ):
-    lock_key = f"resume:complete:{payload.resume_id}"
-    acquired = settings.redis_conn.set(lock_key, 1, ex=30, nx=True)
-
-    try:
-        if not acquired:
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail="Upload completion already in progress for this resume.",
-            )
-
-        async with db_conn.cursor() as aconn:
-            await aconn.execute(
-                """
+    async with db_conn.cursor() as aconn:
+        await aconn.execute(
+            """
                 SELECT
                     resumes.id,
-                    resumes.s3_url
+                    resumes.s3_url,
+                    resumes.upload_status
                 FROM resumes
                 WHERE resumes.id = %s
-                AND resumes.upload_status = 'pending'
-                AND resumes.parsed_data IS NULL
+                FOR UPDATE;
             """,
-                (payload.resume_id,),
-            )
-            resume = await aconn.fetchone()
+            (payload.resume_id,),
+        )
+        resume = await aconn.fetchone()
 
-        if resume is None:
+    if resume is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No resume found for id: {payload.resume_id}",
+        )
+    
+    if resume[2] == "completed":
+        return {"message": "Already processed"}
+
+    try:
+        s3_client.head_object(Bucket=settings.aws_bucket, Key=resume[1])
+    except ClientError as exc:
+        error_code = exc.response["Error"]["Code"]
+        if error_code in ("404", "NoSuchKey"):
             raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"No resume found for id: {payload.resume_id}",
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="File not found in S3 — the upload may not have completed.",
             )
 
-        try:
-            s3_client.head_object(Bucket=settings.aws_bucket, Key=resume[1])
-        except ClientError as exc:
-            error_code = exc.response["Error"]["Code"]
-            if error_code in ("404", "NoSuchKey"):
-                raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                    detail="File not found in S3 — the upload may not have completed.",
-                )
+    async with db_conn.cursor() as cur:
+        await cur.execute(
+            query="""
+                UPDATE ria.resumes
+                SET upload_status = 'completed',
+                    updated_at = NOW()
+                WHERE id = %s
+                AND resumes.upload_status='pending'
+                RETURNING id;
+            """,
+            params=(payload.resume_id,),
+        )
 
-        async with db_conn.cursor() as cur:
-            await cur.execute(
-                query="""
-                    UPDATE ria.resumes
-                    SET upload_status = 'completed',
-                        updated_at = NOW()
-                    WHERE id = %s
-                    AND resumes.upload_status='pending'
-                    RETURNING id;
-                """,
-                params=(payload.resume_id,),
-            )
+        updated = await cur.fetchone()
 
-            updated = await cur.fetchone()
+    if updated is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Resume was already marked as completed.",
+        )
+    
+    await db_conn.commit()
 
-        if updated is None:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="Resume was already marked as completed.",
-            )
-
-        process_and_save_resume.delay(payload.resume_id)  # type: ignore
-    finally:
-        settings.redis_conn.delete(lock_key)
+    process_and_save_resume.delay(payload.resume_id)  # type: ignore
 
     """
     See long polling vs sse 
