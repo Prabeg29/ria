@@ -5,39 +5,33 @@ ARG UID=1000
 ARG GID=1000
 
 ENV PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1 \
-    POETRY_VERSION=2.1.0 \
-    POETRY_NO_INTERACTION=1 \
-    POETRY_VIRTUALENVS_IN_PROJECT=1
+    PYTHONDONTWRITEBYTECODE=1
 
 RUN groupadd --gid ${GID} ria && \
     useradd --uid ${UID} --gid ${GID}  --create-home --shell /bin/bash ria
 
 WORKDIR /opt/app
 
-RUN mkdir -p /opt/app/resumes
+# Stage: uv-base
+FROM base AS uv-base
 
-# Stage: poetry-base
-FROM base AS poetry-base
+COPY pyproject.toml ./
 
-COPY pyproject.toml poetry.lock ./
-
-RUN pip install poetry==${POETRY_VERSION}
+RUN pip install --no-cache-dir uv
 
 # Stage: dev
-FROM poetry-base AS dev
+FROM uv-base AS dev
 
 RUN chown -R ${UID}:${GID} /opt/app
 
 USER ria
 
-RUN poetry install --no-root
+RUN uv sync
 
 # Stage: export-deps
-FROM poetry-base AS export-deps
+FROM uv-base AS export-deps
 
-RUN pip install poetry-plugin-export && \
-    poetry export --without-hashes -f requirements.txt -o requirements.txt
+RUN uv export --format requirements.txt
 
 # Stage: dependencies
 FROM base AS dependencies
