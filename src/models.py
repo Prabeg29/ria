@@ -65,7 +65,7 @@ class ScrapedJob(BaseModel, SoftDeleteMixin):
     url: str = ""
     url_hash: str = ""
     status: str = ""
-    is_archived: bool = False 
+    is_archived: bool = False
     scraped_data: dict[str, Any] = field(default_factory=dict)
     last_scraped_at: datetime | None = None
     is_stale: bool = False

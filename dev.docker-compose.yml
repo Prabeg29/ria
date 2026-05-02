@@ -88,7 +88,6 @@ services:
       - ./src:/opt/app/src
       - ./pyproject.toml:/opt/app/pyproject.toml
       - ./poetry.lock:/opt/app/poetry.lock
-      - resumes:/opt/app/resumes
     ports:
       - 8000:8000
     command: poetry run uvicorn src.main:app --host 0.0.0.0 --port 8000 --reload
@@ -107,10 +106,9 @@ services:
       - ./src:/opt/app/src
       - ./pyproject.toml:/opt/app/pyproject.toml
       - ./poetry.lock:/opt/app/poetry.lock
-      - resumes:/opt/app/resumes
     deploy:
       replicas: 3
-    command: poetry run rq worker default --verbose --with-scheduler
+    command: poetry run rq worker -w src.worker.CustomWorker --verbose --with-scheduler default
     networks:
       - ria
 

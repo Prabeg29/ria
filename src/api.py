@@ -1,13 +1,8 @@
 import json
 import uuid
 
-from datetime import datetime
-from dataclasses import dataclass
-
-import aiofiles
-import pymupdf
-
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, status
+from botocore.exceptions import ClientError
+from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
 from psycopg import sql
 from psycopg.rows import class_row
@@ -15,135 +10,219 @@ from rq.exceptions import NoSuchJobError
 from rq.job import Job
 
 from .deps import (
-    get_resume_upload_dir,
     get_db_connection,
     get_scraper_registry,
+    verify_content_hash_header,
 )
 from .logger import REQUEST_ID_CTX, logger
 from .jobs import (
+    extract_resume_text,
+    parse_resume_with_llm,
     ingress_llm,
-    process_and_save_resume,
     scrape_job_details,
-    upload_resume_to_s3,
 )
 from .models import Resume
+from .schemas import (
+    ResumeAnalyzeSchema,
+    ResumeUploadPayload,
+    ResumeUploadCompletePayload,
+    ResumeUploadInitResponse,
+)
 from .settings import settings
 from .redis import async_redis
-from .text_processor import TextPreprocessor
-from .utils import hash_url
+from .utils import hash_url, s3_client
 
 
 router = APIRouter(prefix="")
 
 
-VALID_FILE_FORMATS = {
-    "application/pdf",
-    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-}
-MAX_FILE_SIZE = 2 * 1024 * 1024  # 2MB
-CHUNK_SIZE = 1024 * 1024  # 1MB
-
-
-@router.post("/resumes/upload")
+@router.post(
+    "/resumes/upload/init",
+    response_model=ResumeUploadInitResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Initiates a resume upload by creating a record and generating an S3 URL.",
+    description="""Registers the resume metadata in the database using an upsert strategy on the
+    content hash. If the resume already exists and is not in a 'pending' state, or
+    if a presigned URL was generated recently, the request is rejected to prevent
+    duplicates."""
+)
 async def upload_resume(
-    file: UploadFile,
-    resume_upload_dir=Depends(get_resume_upload_dir),
+    payload: ResumeUploadPayload,
+    content_hash: str = Depends(verify_content_hash_header),
     db_conn=Depends(get_db_connection),
 ):
-    if not file.filename or not file.filename.strip():
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail="Filename is required",
-        )
+    """
+    Args:
+        payload: The resume metadata including filename and content type.
+        content_hash: The SHA-256 hash of the file content from the header.
+        db_conn: The asynchronous database connection.
 
-    if file.content_type not in VALID_FILE_FORMATS:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail="Invalid file format. Only PDF and DOCX are allowed.",
-        )
+    Returns:
+        A dictionary containing the resume ID and the S3 presigned POST URL.
 
-    if file.size and file.size > MAX_FILE_SIZE:
-        raise HTTPException(
-            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
-            detail="File size exceeds the maximum limit of 2MB.",
-        )
-    
-    content_buffer = await file.read()
-    
-    with pymupdf.open(stream=content_buffer) as doc:
-        text = chr(12).join([page.get_text() for page in doc])  # type: ignore
-
-    raw_text = (
-        TextPreprocessor(text)
-            .remove_extra_whitespace()
-            .normalize_unicode()
-            .remove_boilerplates()
-            .redact_pii()
-            .get_text()
-    )
-
-    if not raw_text:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail="File is empty.",
-        )
-
-    ts = datetime.now().strftime("%Y%m%d%H%M%S%f")
-    stem, sep, ext = file.filename.rpartition(".")
-    timestamped_name = f"{stem}-{ts}{sep}{ext}"
-
-    destination_path = resume_upload_dir / timestamped_name
-
-    async with aiofiles.open(destination_path, "wb") as out_file:
-        while content := await file.read(CHUNK_SIZE):
-            await out_file.write(content)
-
-    logger.info(f"[POST: /resumes/upload]: File saved to {resume_upload_dir}", extra={
-        "uploaded_resume": timestamped_name,
-    })
-
+    Raises:
+        HTTPException: If the file has been previously uploaded or if an upload
+            is already in progress for this content hash.
+    """
     resume = Resume(
-        filename=file.filename,
-        raw_text=raw_text,
-        parsed_data={},
-        s3_url=None,
+        filename=payload.filename,
     )
+    resume.s3_url = f"resumes/{resume.id}-{payload.filename}"
 
-    query = sql.SQL("""
-            INSERT INTO ria.resumes (id, filename, raw_text, parsed_data, s3_url, created_at, updated_at)
-            VALUES (%s, %s, %s, %s, %s, NOW(), NOW())
-        """
+    async with db_conn.cursor() as cur:
+        await cur.execute(
+            sql.SQL(
+                """
+                    INSERT INTO ria.resumes (
+                        id,
+                        filename,
+                        content_hash,
+                        s3_url,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES (%s, %s, %s, %s, NOW(), NOW())
+                    ON CONFLICT (content_hash) DO UPDATE
+                    SET updated_at = NOW()
+                    WHERE resumes.upload_status = 'pending'
+                    AND (
+                            resumes.last_upload_presigned_url_generated_at is NULL
+                            OR
+                            resumes.last_upload_presigned_url_generated_at < NOW() - INTERVAL '3 minutes'
+                        )
+                    RETURNING id, s3_url;
+                """
+            ),
+            (
+                resume.id,
+                resume.filename,
+                content_hash,
+                resume.s3_url,
+            ),
         )
-    await db_conn.execute(
-        query,
-        (
-            resume.id,
-            resume.filename,
-            resume.raw_text,
-            json.dumps(resume.parsed_data),
-            resume.s3_url,
-        ),
+
+        row = await cur.fetchone()
+
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="File has been previously uploaded, skipping processing",
+        )
+
+    url = s3_client.generate_presigned_post(
+        Bucket=settings.aws_bucket,
+        Key=row[1],
+        Fields={"Content-Type": payload.content_type},
+        Conditions=[
+            ["eq", "$Content-Type", payload.content_type],
+            ["content-length-range", 50, 1024 * 1024],
+        ],
+        ExpiresIn=settings.aws_s3_presigned_url_expiresin,
     )
 
-    logger.info(f"[POST: /resumes/upload]: Resume saved to db", extra={
-        "resume_id": resume.id,
-    })
+    await db_conn.execute(
+        query="""
+            UPDATE ria.resumes
+            SET last_upload_presigned_url_generated_at = NOW(),
+                updated_at = NOW()
+            WHERE content_hash = %s;
+        """,
+        params=(content_hash,),
+    )
+
+    return ResumeUploadInitResponse(id=row[0], upload_url=url)
+
+
+@router.post(
+    "/resumes/upload/complete",
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Dispatches the resume uploaded for LLM extraction",
+    description="""Validates resumes upload through DB and S3 checks.
+    Dispatches the resumes with valid upload for LLM extraction
+    """
+)
+async def update_resume(
+    payload: ResumeUploadCompletePayload,
+    db_conn=Depends(get_db_connection),
+):
+    """
+    Args:
+        payload: The resume metadata including id.
+        db_conn: The asynchronous database connection.
+
+    Returns:
+        Success message
+
+    Raises:
+        HTTPException: If the file has been previously dispatched for LLM extraction 
+        or if there was no upload.
+    """
+    async with db_conn.cursor() as aconn:
+        await aconn.execute(
+            """
+                SELECT
+                    resumes.id,
+                    resumes.s3_url,
+                    resumes.upload_status
+                FROM resumes
+                WHERE resumes.id = %s
+                FOR UPDATE;
+            """,
+            (payload.resume_id,),
+        )
+        resume = await aconn.fetchone()
+
+    if resume is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No resume found for id: {payload.resume_id}",
+        )
     
-    logger.info(f"[POST: /resumes/upload]: Resume dispatched for LLM extraction", extra={
-        "resume_id": resume.id,
-    })
-    process_and_save_resume.delay(REQUEST_ID_CTX.get(), resume.id)  # type: ignore
-    logger.info(f"[POST: /resumes/upload]: Resume dispatched for S3 uploads", extra={
-        "resume_id": resume.id,
-    })
-    upload_resume_to_s3.delay(REQUEST_ID_CTX.get(), resume.id, destination_path,)  # type: ignore
+    if resume[2] == "completed":
+        return {"message": "Already processed"}
 
-    return {"message": "Resume uploaded and processing initiated", "resume_id": str(resume.id)}
+    try:
+        s3_client.head_object(Bucket=settings.aws_bucket, Key=resume[1])
+    except ClientError as exc:
+        error_code = exc.response["Error"]["Code"]
+        if error_code in ("404", "NoSuchKey"):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="File not found in S3 — the upload may not have completed.",
+            )
+        raise
 
+    async with db_conn.cursor() as cur:
+        await cur.execute(
+            query="""
+                UPDATE ria.resumes
+                SET upload_status = 'completed',
+                    updated_at = NOW()
+                WHERE id = %s
+                AND resumes.upload_status='pending'
+                RETURNING id;
+            """,
+            params=(payload.resume_id,),
+        )
 
-@dataclass
-class ResumeAnalyzeSchema:
-    job_url: str
+        updated = await cur.fetchone()
+
+    if updated is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Resume was already marked as completed.",
+        )
+    
+    extract_job = extract_resume_text.delay(updated[0]) # type: ignore
+
+    parse_resume_with_llm.delay( # type: ignore
+        updated[0],
+        depends_on=extract_job,
+    )
+
+    process_and_save_resume.delay(payload.resume_id)  # type: ignore
+
+    return {"message": "Resume sent for LLM parsing"}
 
 
 @router.post("/resumes/{resume_id}/analyze", status_code=status.HTTP_202_ACCEPTED)
@@ -151,10 +230,11 @@ async def analyze_resume(
     resume_id: str,
     payload: ResumeAnalyzeSchema,
     db_conn=Depends(get_db_connection),
-    scraper_registry=Depends(get_scraper_registry)
+    scraper_registry=Depends(get_scraper_registry),
 ):
     async with db_conn.cursor(row_factory=class_row(Resume)) as cur:
-        await cur.execute("""
+        await cur.execute(
+            """
                 SELECT
                     resumes.id,
                     resumes.raw_text
@@ -162,13 +242,16 @@ async def analyze_resume(
                 WHERE resumes.id = %s
             """,
             (resume_id,),
-            )
-            
+        )
+
         resume = await cur.fetchone()
 
     if resume is None:
-        raise Exception(f"No resume found with ID {resume_id}.")
-    
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No resume found with ID {resume_id}.",
+        )
+
     job_scraper = scraper_registry.resolve(payload.job_url)
     normalized_url = job_scraper.normalize(payload.job_url)
     url_hash = hash_url(normalized_url)
@@ -192,8 +275,9 @@ async def analyze_resume(
                     AND scraped_jobs.is_archived = false
                     OR scraped_jobs.status NOT IN ('queued', 'scraping')
                 RETURNING id;
-            """, 
-        params=(str(uuid.uuid4()), normalized_url, url_hash))
+            """,
+            params=(str(uuid.uuid4()), normalized_url, url_hash),
+        )
 
         row = await cur.fetchone()
 
@@ -206,10 +290,10 @@ async def analyze_resume(
                 "raw_job_url": payload.job_url,
                 "normalized_job_url": normalized_url,
                 "url_hash": url_hash,
-            }
+            },
         )
 
-        scrape_job = scrape_job_details.delay( # type: ignore
+        scrape_job = scrape_job_details.delay(  # type: ignore
             REQUEST_ID_CTX.get(),
             job_scraper,
             normalized_url,
@@ -228,14 +312,11 @@ async def analyze_resume(
             "raw_job_url": payload.job_url,
             "normalized_job_url": normalized_url,
             "url_hash": url_hash,
-        }
+        },
     )
 
-    ingress_llm.delay( # type: ignore
-        REQUEST_ID_CTX.get(),
-        resume.raw_text,
-        url_hash,
-        depends_on=scrape_job
+    ingress_llm.delay(  # type: ignore
+        REQUEST_ID_CTX.get(), resume.raw_text, url_hash, depends_on=scrape_job
     )
 
     return {"status": "queued", "job_id": REQUEST_ID_CTX.get()}
@@ -272,7 +353,7 @@ async def analysis_generator(job_id: str):
 
             yield build_sse_event(payload, event_type)
 
-            if event_type == "done":                    
+            if event_type == "done":
                 return
 
 
@@ -284,5 +365,5 @@ async def stream_job_analysis(job_id: str):
         headers={
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
-        }
+        },
     )
