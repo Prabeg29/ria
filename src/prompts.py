@@ -62,7 +62,7 @@ If you output backticks, markdown, or anything other than plain JSON, you FAIL t
 """
 
 
-ANALYZE_RESUME_AGAINST_JOB_PROMPT="""
+ANALYZE_RESUME_AGAINST_JOB_PROMPT = """
 Build me an intelligent resume reviewer that analyses a resume against a job
 description, providing actionable feedback and suggestions based on the 
 proven XYZ formula to help you stand out. Both the resume and the job 

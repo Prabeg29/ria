@@ -9,7 +9,7 @@ load_dotenv(verbose=True)
 class Settings:
     app_name = os.getenv("APP_NAME", "RIA")
     app_env = os.getenv("APP_ENV", "development")
-    
+
     browerless_ws = os.getenv("BROWSERLESS_WS", "")
 
     log_level = os.getenv("LOG_LEVEL", "INFO")
@@ -36,6 +36,7 @@ class Settings:
     aws_secret_key = os.getenv("AWS_SECRET_ACCESS_KEY", "")
     aws_region = os.getenv("AWS_DEFAULT_REGION", "ap-southeast-2")
     aws_bucket = os.getenv("AWS_BUCKET", "")
+    aws_s3_presigned_url_expiresin = int(os.getenv("AWS_S3_PRESIGNED_URL_EXPIRESIN", 180))
 
     redis_host = os.getenv("REDIS_HOST", "localhost")
     redis_port = int(os.getenv("REDIS_PORT", 6379))
@@ -43,5 +44,6 @@ class Settings:
     @property
     def redis_conn(self):
         return Redis(host=self.redis_host, port=self.redis_port)
+
 
 settings = Settings()

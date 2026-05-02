@@ -70,9 +70,8 @@ def retry_with_exponential_backoff(
 # Exit retry for non-transient exceptions
 # ----------------------------------------------------
 def handle_retry(job, connection, type, value, traceback):
-    logger.info(job)
-    pass
-
+    print(job.args)
+    print("type", type) # Exception is here
 
 @job(
     "default",
@@ -81,36 +80,35 @@ def handle_retry(job, connection, type, value, traceback):
     retry=retry_with_exponential_backoff(3, initial=30),
     on_failure=handle_retry,
 )
-async def process_and_save_resume(resume_id: uuid.UUID) -> None:
+async def extract_resume_text(resume_id: uuid.UUID) -> None:
     async with db_conn() as aconn:
-        async with aconn.cursor(row_factory=class_row(Resume)) as cur:
-            await cur.execute(
+        async with aconn.cursor(row_factory=class_row(Resume)) as acur:
+            await acur.execute(
                 """
-                SELECT
-                    resumes.id,
-                    resumes.raw_text,
-                    resumes.parsed_data,
-                    resumes.s3_url
-                FROM resumes
-                WHERE resumes.id = %s
-                AND resumes.parsed_data IS NULL
-            """,
+                    SELECT
+                        resumes.id,
+                        resumes.raw_text,
+                        resumes.s3_url,
+                        resumes.upload_status
+                    FROM resumes
+                    WHERE resumes.id = %s
+                        AND resumes.upload_status = 'completed'
+                        AND resumes.raw_text IS NULL
+                    FOR UPDATE SKIP LOCKED;
+                """,
                 (resume_id,),
             )
-            resume = await cur.fetchone()
+            resume = await acur.fetchone()
 
-    if resume is None:
-        logger.error(
-            f"[process_and_save_resume]: No resume found",
-            extra={"resume_id": resume_id},
-        )
-        return
+        if resume is None:
+            logger.info(
+                "[extract_resume_text]: Resume not eligible — already extracted, locked, or not found",
+                extra={"resume_id": resume_id},
+            )
+            return
 
-    if resume.raw_text is None:
-        raw_text = ""
         response = s3_client.get_object(Bucket=settings.aws_bucket, Key=resume.s3_url)
         file_content = response["Body"].read()
-
 
         with pymupdf.open(stream=file_content, filetype="pdf") as doc:
             raw_text = chr(12).join([page.get_text() for page in doc])  # type: ignore
@@ -126,60 +124,117 @@ async def process_and_save_resume(resume_id: uuid.UUID) -> None:
 
         if not raw_text:
             logger.error(
-                f"[process_and_save_resume]: File is empty",
+                "[extract_resume_text]: Resume is empty after preprocessing — marking failed",
+                extra={"resume_id": resume_id},
+            )
+
+            await aconn.execute(
+                """
+                    UPDATE ria.resumes
+                    SET upload_status = 'failed',
+                        updated_at = NOW()
+                    WHERE id = %s
+                """,
+                (resume.id,),
+            )
+
+            raise ValueError(f"Resume {resume_id} is empty after preprocessing")
+
+        await aconn.execute(
+            """
+                UPDATE resumes
+                SET raw_text = %s,
+                updated_at = NOW()
+                WHERE id = %s
+            """,
+            (
+                raw_text,
+                resume.id,
+            ),
+        )
+
+
+@job(
+    "default",
+    connection=settings.redis_conn,
+    queue_class=CustomQueue,
+    retry=retry_with_exponential_backoff(3, initial=60),
+    on_failure=handle_retry,
+)
+async def parse_resume_with_llm(resume_id: uuid.UUID) -> None:
+    async with db_conn() as aconn:
+        async with aconn.cursor(row_factory=class_row(Resume)) as cur:
+            await cur.execute(
+                """
+                SELECT
+                    resumes.id,
+                    resumes.raw_text,
+                    resumes.upload_status,
+                FROM resumes
+                WHERE resumes.id = %s
+                    AND resumes.upload_status = 'extracted'
+                    AND resumes.parsed_data IS NULL
+                FOR UPDATE SKIP LOCKED;
+            """,
+                (resume_id,),
+            )
+            resume = await cur.fetchone()
+
+        if resume is None:
+            logger.info(
+                "[parse_resume_with_llm]: Resume not eligible — already parsed, locked, or not found",
                 extra={"resume_id": resume_id},
             )
             return
 
-        async with db_conn() as aconn:
-            await aconn.execute(
-                """
-                    UPDATE resumes
-                    SET raw_text = %s,
-                    updated_at = NOW()
-                    WHERE id = %s
-                """,
-                (
-                    raw_text,
-                    resume.id,
-                ),
+        try:
+            logger.info(
+                f"[process_and_save_resume]: Extracting content in json...",
+                extra={"resume_id": resume_id},
             )
-
-        resume.raw_text = raw_text
-
-    logger.info(
-        f"[process_and_save_resume]: Extracting content in json...",
-        extra={"resume_id": resume_id},
-    )
-    response = gemini_client.models.generate_content(
-        model=settings.gemini_model,
-        contents=EXTRACT_RESUME_PROMPT.format(text=resume.raw_text),
-    )
-
-    if response.text is None:
-        logger.error(
-            f"[process_and_save_resume]: Error processing resume",
-            extra={"resume_id": resume_id},
+            response = await gemini_client.aio.models.generate_content(
+                model=settings.gemini_model,
+                contents=EXTRACT_RESUME_PROMPT.format(text=resume.raw_text),
         )
-        return
+        except Exception:
+            logger.error(
+                "[parse_resume_with_llm]: Gemini call failed",
+                extra={"resume_id": resume_id},
+                exc_info=True,
+            )
+            raise
 
-    clean = response.text.strip().strip("`").replace("```json", "").replace("```", "")
-    parsed_data = json.loads(clean)
+        if response.text is None:
+            logger.error(
+                "[parse_resume_with_llm]: Gemini returned empty response",
+                extra={"resume_id": resume_id},
+            )
+            raise ValueError(f"Gemini returned no content for resume {resume_id}")
 
-    async with db_conn() as aconn:
+        try:
+            clean = response.text.strip().strip("`").replace("```json", "").replace("```", "")
+            parsed_data = json.loads(clean)
+        except json.JSONDecodeError:
+            logger.error(
+                "[parse_resume_with_llm]: Failed to parse Gemini response as JSON",
+                extra={"resume_id": resume_id, "raw_response": response.text[:500]},
+            )
+            raise
+
         await aconn.execute(
             """
                 UPDATE resumes
                 SET parsed_data = %s,
-                updated_at = NOW()
+                    upload_status = 'parsed'
+                    updated_at = NOW()
                 WHERE id = %s
+                    AND upload_status = 'extracted';
             """,
             (
                 Json(parsed_data),
                 resume.id,
             ),
         )
-        await aconn.commit()
 
     logger.info(
         f"[process_and_save_resume]: Updated resume with parsed data",
@@ -188,15 +243,15 @@ async def process_and_save_resume(resume_id: uuid.UUID) -> None:
 
 
 @job(
-    queue="default",
+    "default",
     connection=settings.redis_conn,
-    retry=Retry(max=3, interval=[1, 30, 60]),
+    queue_class=CustomQueue,
+    retry=retry_with_exponential_backoff(3, initial=30),
+    on_failure=handle_retry,
 )
 async def scrape_job_details(
     request_id: str, job_scraper: JobScraper, normalized_url: str, url_hash: str
 ) -> None:
-    REQUEST_ID_CTX.set(request_id)
-
     await publish(
         request_id, "status", {"status": "scraping", "message": "Accessing job url..."}
     )
@@ -316,9 +371,11 @@ async def ingest_llm(resume_text: str, job_data):
 
 
 @job(
-    queue="default",
+    "default",
     connection=settings.redis_conn,
-    retry=Retry(max=3, interval=[1, 30, 60]),
+    queue_class=CustomQueue,
+    retry=retry_with_exponential_backoff(3, initial=30),
+    on_failure=handle_retry,
 )
 async def ingress_llm(request_id: str, resume_text: str, url_hash: str):
     REQUEST_ID_CTX.set(request_id)

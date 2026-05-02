@@ -16,8 +16,9 @@ from .deps import (
 )
 from .logger import REQUEST_ID_CTX, logger
 from .jobs import (
+    extract_resume_text,
+    parse_resume_with_llm,
     ingress_llm,
-    process_and_save_resume,
     scrape_job_details,
 )
 from .models import Resume
@@ -132,11 +133,30 @@ async def upload_resume(
     return ResumeUploadInitResponse(id=row[0], upload_url=url)
 
 
-@router.post("/resumes/upload/complete")
+@router.post(
+    "/resumes/upload/complete",
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Dispatches the resume uploaded for LLM extraction",
+    description="""Validates resumes upload through DB and S3 checks.
+    Dispatches the resumes with valid upload for LLM extraction
+    """
+)
 async def update_resume(
     payload: ResumeUploadCompletePayload,
     db_conn=Depends(get_db_connection),
 ):
+    """
+    Args:
+        payload: The resume metadata including id.
+        db_conn: The asynchronous database connection.
+
+    Returns:
+        Success message
+
+    Raises:
+        HTTPException: If the file has been previously dispatched for LLM extraction 
+        or if there was no upload.
+    """
     async with db_conn.cursor() as aconn:
         await aconn.execute(
             """
@@ -170,6 +190,7 @@ async def update_resume(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail="File not found in S3 — the upload may not have completed.",
             )
+        raise
 
     async with db_conn.cursor() as cur:
         await cur.execute(
@@ -192,13 +213,15 @@ async def update_resume(
             detail="Resume was already marked as completed.",
         )
     
-    await db_conn.commit()
+    extract_job = extract_resume_text.delay(updated[0]) # type: ignore
+
+    parse_resume_with_llm.delay( # type: ignore
+        updated[0],
+        depends_on=extract_job,
+    )
 
     process_and_save_resume.delay(payload.resume_id)  # type: ignore
 
-    """
-    See long polling vs sse 
-    """
     return {"message": "Resume sent for LLM parsing"}
 
 

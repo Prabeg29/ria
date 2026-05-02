@@ -28,7 +28,7 @@ class JobScraper(ABC):
     @abstractmethod
     def _allowed_query_params(self) -> Set[str]:
         pass
-    
+
     def normalize(self, url: str) -> str:
         parsed_url = urlparse(url.strip())
 
@@ -52,7 +52,7 @@ class JobScraper(ABC):
         query_params.sort()
         query = urlencode(query_params)
 
-        return urlunparse((scheme, netloc, path, '', query, ''))
+        return urlunparse((scheme, netloc, path, "", query, ""))
 
     @abstractmethod
     async def extract(self, page: Page) -> dict[str, str]:
@@ -60,7 +60,7 @@ class JobScraper(ABC):
 
 
 class SeekJobScraper(JobScraper):
-    JOB_PATH_PATTERN = re.compile(r"^/job/(\d+)$") 
+    JOB_PATH_PATTERN = re.compile(r"^/job/(\d+)$")
 
     @property
     def _allowed_query_params(self) -> Set[str]:
@@ -81,26 +81,34 @@ class SeekJobScraper(JobScraper):
             job_id = match.group(1)
         elif "jobId" in query_params:
             job_id = query_params["jobId"][0]
-        
+
         if job_id is None:
             raise ValueError("The seek job url has no job selected")
-            
+
         return f"https://www.seek.com.au/job/{job_id}"
 
     @retry(
         before_sleep=before_sleep_log(logger, logging.WARNING),
         retry=retry_if_exception_type((TimeoutError,)),
         stop=stop_after_attempt(3),
-        wait=wait_random_exponential(multiplier=1, min=2, max=10)
+        wait=wait_random_exponential(multiplier=1, min=2, max=10),
     )
     async def extract(self, page) -> dict[str, Any]:
-        title = await page.locator('h1[data-automation="job-detail-title"]').inner_text()
-        company = await page.locator('span[data-automation="advertiser-name"]').inner_text()
-        location = await page.locator('span[data-automation="job-detail-location"]').inner_text()
-        details = await page.locator('div[data-automation="jobAdDetails"]').all_text_contents()
+        title = await page.locator(
+            'h1[data-automation="job-detail-title"]'
+        ).inner_text()
+        company = await page.locator(
+            'span[data-automation="advertiser-name"]'
+        ).inner_text()
+        location = await page.locator(
+            'span[data-automation="job-detail-location"]'
+        ).inner_text()
+        details = await page.locator(
+            'div[data-automation="jobAdDetails"]'
+        ).all_text_contents()
 
         return {
-            "title": title, 
+            "title": title,
             "company": company,
             "location": location,
             "details": details,
@@ -121,7 +129,7 @@ class ScraperRegistry:
 
         if not hostname:
             raise ValueError("URL has no valid hostname")
-        
+
         scraper = cls._registry.get(hostname)
 
         if not scraper:

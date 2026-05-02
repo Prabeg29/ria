@@ -23,19 +23,18 @@ class ContextFilter(logging.Filter):
         return True
 
 
-class StructuredJsonFormatter(JsonFormatter):   
+class StructuredJsonFormatter(JsonFormatter):
     def add_fields(
         self,
         log_data: Dict[str, Any],
         record: logging.LogRecord,
-        message_dict: Dict[str, Any]
+        message_dict: Dict[str, Any],
     ) -> None:
         super().add_fields(log_data, record, message_dict)
         log_data["request_id"] = getattr(record, "request_id", None)
-        if not log_data.get('timestamp'):
+        if not log_data.get("timestamp"):
             log_data["timestamp"] = datetime.fromtimestamp(
-                record.created,
-                tz=timezone.utc
+                record.created, tz=timezone.utc
             ).isoformat()
 
 
@@ -50,11 +49,11 @@ LOGGING_CONFIG = {
     "formatters": {
         "standard": {
             "format": "%(asctime)s [%(levelname)s] [%(request_id)s] %(name)s: %(message)s",
-            "datefmt": "%Y-%m-%d %H:%M:%S"
+            "datefmt": "%Y-%m-%d %H:%M:%S",
         },
         "json": {
             "()": StructuredJsonFormatter,
-            "format": "%(timestamp)s %(levelname)s %(name)s %(request_id)s %(message)s"
+            "format": "%(timestamp)s %(levelname)s %(name)s %(request_id)s %(message)s",
         },
     },
     "handlers": {
@@ -87,7 +86,7 @@ def setup_logging() -> logging.Logger:
 
     listener = QueueListener(
         log_queue,
-        console_handler, # type: ignore
+        console_handler,  # type: ignore
         respect_handler_level=True,
     )
 
@@ -95,5 +94,6 @@ def setup_logging() -> logging.Logger:
     atexit.register(listener.stop)
 
     return logging.getLogger(settings.app_name)
+
 
 logger = setup_logging()

@@ -108,7 +108,7 @@ services:
       - ./poetry.lock:/opt/app/poetry.lock
     deploy:
       replicas: 3
-    command: poetry run rq worker default --verbose --with-scheduler
+    command: poetry run rq worker -w src.worker.CustomWorker --verbose --with-scheduler default
     networks:
       - ria
 

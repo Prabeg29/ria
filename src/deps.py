@@ -5,7 +5,9 @@ from .job_scraper import ScraperRegistry
 
 
 def verify_content_hash_header(
-    x_content_hash: str | None = Header(default=None, description="SHA-256 hash of the file content")
+    x_content_hash: str | None = Header(
+        default=None, description="SHA-256 hash of the file content"
+    )
 ) -> str:
     if not x_content_hash or not x_content_hash.strip():
         raise HTTPException(
