@@ -1,3 +1,7 @@
+CREATE SCHEMA IF NOT EXISTS ria;
+
+SET search_path TO ria;
+
 CREATE TABLE IF NOT EXISTS ria.resumes(
     id UUID NOT NULL,
     filename VARCHAR(255) NOT NULL,
