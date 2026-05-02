@@ -31,7 +31,7 @@ RUN uv sync
 # Stage: export-deps
 FROM uv-base AS export-deps
 
-RUN uv export --format requirements.txt
+RUN uv export --format requirements.txt --no-dev -o requirements.txt
 
 # Stage: dependencies
 FROM base AS dependencies
