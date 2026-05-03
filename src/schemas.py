@@ -23,7 +23,7 @@ class ResumeUploadPayload(BaseModel):
 
 
 class ResumeUploadCompletePayload(BaseModel):
-    resume_id: str
+    resume_id: UUID
 
 
 @dataclass

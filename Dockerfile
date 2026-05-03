@@ -26,7 +26,7 @@ RUN chown -R ${UID}:${GID} /opt/app
 
 USER ria
 
-RUN uv sync
+RUN uv sync --frozen
 
 # Stage: export-deps
 FROM uv-base AS export-deps
