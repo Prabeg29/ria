@@ -15,7 +15,7 @@ WORKDIR /opt/app
 # Stage: uv-base
 FROM base AS uv-base
 
-COPY pyproject.toml ./
+COPY pyproject.toml uv.lock ./
 
 RUN pip install --no-cache-dir uv
 

@@ -87,6 +87,7 @@ services:
     volumes:
       - ./src:/opt/app/src
       - ./pyproject.toml:/opt/app/pyproject.toml
+      - ./uv.lock:/opt/app/uv.lock
     ports:
       - 8000:8000
     command: uv run uvicorn src.main:app --host 0.0.0.0 --port 8000 --reload
@@ -104,6 +105,7 @@ services:
     volumes:
       - ./src:/opt/app/src
       - ./pyproject.toml:/opt/app/pyproject.toml
+      - ./uv.lock:/opt/app/uv.lock
     deploy:
       replicas: 3
     command: uv run rq worker -w src.worker.CustomWorker --verbose --with-scheduler default
