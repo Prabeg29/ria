@@ -22,7 +22,7 @@ class ResumeUploadRequest(BaseModel):
     content_type: MimeType
 
 
-class ResumeUploadCompletePayload(BaseModel):
+class ResumeUploadCompleteRequest(BaseModel):
     resume_id: UUID
 
 

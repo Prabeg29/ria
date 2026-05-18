@@ -25,7 +25,7 @@ from .models import Resume
 from .schemas import (
     ResumeAnalyzeSchema,
     ResumeUploadRequest,
-    ResumeUploadCompletePayload,
+    ResumeUploadCompleteRequest,
     ResumeUploadInitResponse,
 )
 from .settings import settings
@@ -146,12 +146,17 @@ async def upload_resume(
     Dispatches the resumes with valid upload for LLM extraction
     """
 )
+@rate_limiter.limit("5/minute")
 async def update_resume(
-    payload: ResumeUploadCompletePayload,
+    request: Request,
+    response: Response,
+    payload: ResumeUploadCompleteRequest,
     db_conn=Depends(get_db_connection),
 ):
     """
     Args:
+        request: Request object from FastAPI, explicit declaration for SlowAPI
+        response: Response object from FastAPI, explicit declaration for SlowAPI
         payload: The resume metadata including id.
         db_conn: The asynchronous database connection.
 
@@ -183,11 +188,13 @@ async def update_resume(
             detail=f"No resume found for id: {payload.resume_id}",
         )
     
-    if resume[2] == "completed":
+    [resume_id, s3_key, upload_status] = resume
+    
+    if upload_status == "completed":
         return {"message": "Already processed"}
 
     try:
-        s3_client.head_object(Bucket=settings.aws_bucket, Key=resume[1])
+        s3_client.head_object(Bucket=settings.aws_bucket, Key=s3_key)
     except ClientError as exc:
         error_code = exc.response["Error"]["Code"]
         if error_code in ("404", "NoSuchKey"):
@@ -197,35 +204,23 @@ async def update_resume(
             )
         raise
 
-    async with db_conn.cursor() as cur:
-        await cur.execute(
-            query="""
-                UPDATE ria.resumes
-                SET upload_status = 'completed',
-                    updated_at = NOW()
-                WHERE id = %s
-                AND resumes.upload_status='pending'
-                RETURNING id;
-            """,
-            params=(payload.resume_id,),
-        )
-
-        updated = await cur.fetchone()
-
-    if updated is None:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Resume was already marked as completed.",
-        )
+    await db_conn.execute(
+        query="""
+            UPDATE ria.resumes
+            SET upload_status = 'completed',
+                updated_at = NOW()
+            WHERE id = %s
+            AND resumes.upload_status='pending';
+        """,
+        params=(payload.resume_id,),
+    )
     
-    extract_job = extract_resume_text.delay(updated[0]) # type: ignore
+    extract_job = extract_resume_text.delay(resume_id) # type: ignore
 
     parse_resume_with_llm.delay( # type: ignore
-        updated[0],
+        resume_id,
         depends_on=extract_job,
     )
-
-    process_and_save_resume.delay(payload.resume_id)  # type: ignore
 
     return {"message": "Resume sent for LLM parsing"}
 
