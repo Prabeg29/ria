@@ -55,3 +55,21 @@ END $$;
 
 ALTER TABLE ria.resumes 
 ADD COLUMN IF NOT EXISTS upload_status resume_upload_status DEFAULT 'pending';
+
+CREATE TABLE IF NOT EXISTS ria.tenants(
+    id UUID PRIMARY KEY,
+    email VARCHAR(255) UNIQUE NOT NULL,
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW() 
+);
+
+CREATE TABLE IF NOT EXISTS ria.api_keys(
+    id UUID PRIMARY KEY,
+    tenant_id UUID REFERENCES tenants ON DELETE CASCADE,
+    key_hash CHAR(64) UNIQUE,
+    last_used_at TIMESTAMP,
+    created_at TIMESTAMP DEFAULT NOW() NOT NULL,
+    updated_at TIMESTAMP DEFAULT NOW() NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS ix_ria_api_keys_key_hash ON ria.api_keys(key_hash);

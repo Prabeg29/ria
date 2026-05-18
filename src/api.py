@@ -2,7 +2,7 @@ import json
 import uuid
 
 from botocore.exceptions import ClientError
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.responses import StreamingResponse
 from psycopg import sql
 from psycopg.rows import class_row
@@ -24,13 +24,13 @@ from .jobs import (
 from .models import Resume
 from .schemas import (
     ResumeAnalyzeSchema,
-    ResumeUploadPayload,
+    ResumeUploadRequest,
     ResumeUploadCompletePayload,
     ResumeUploadInitResponse,
 )
 from .settings import settings
 from .redis import async_redis
-from .utils import hash_url, s3_client
+from .utils import hash_url, rate_limiter, s3_client
 
 
 router = APIRouter(prefix="")
@@ -46,14 +46,19 @@ router = APIRouter(prefix="")
     if a presigned URL was generated recently, the request is rejected to prevent
     duplicates."""
 )
+@rate_limiter.limit("20/minute")
 async def upload_resume(
-    payload: ResumeUploadPayload,
+    request: Request,
+    response: Response,
+    payload: ResumeUploadRequest,
     content_hash: str = Depends(verify_content_hash_header),
     db_conn=Depends(get_db_connection),
 ):
     """
     Args:
-        payload: The resume metadata including filename and content type.
+        request: Request object from FastAPI, explicit declaration for SlowAPI
+        response: Response object from FastAPI, explicit declaration for SlowAPI
+        payload: The resume metadata including filename, size, and content type.
         content_hash: The SHA-256 hash of the file content from the header.
         db_conn: The asynchronous database connection.
 
@@ -101,9 +106,9 @@ async def upload_resume(
             ),
         )
 
-        row = await cur.fetchone()
+        [resume_id, s3_key] = await cur.fetchone()
 
-    if row is None:
+    if resume_id is None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="File has been previously uploaded, skipping processing",
@@ -111,7 +116,7 @@ async def upload_resume(
 
     url = s3_client.generate_presigned_post(
         Bucket=settings.aws_bucket,
-        Key=row[1],
+        Key=s3_key,
         Fields={"Content-Type": payload.content_type},
         Conditions=[
             ["eq", "$Content-Type", payload.content_type],
@@ -130,7 +135,7 @@ async def upload_resume(
         params=(content_hash,),
     )
 
-    return ResumeUploadInitResponse(id=row[0], upload_url=url)
+    return ResumeUploadInitResponse(id=resume_id, upload_url=url)
 
 
 @router.post(

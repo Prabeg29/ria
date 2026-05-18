@@ -26,7 +26,7 @@ APIs cannot be considered production ready APIs if they do not have any auth and
 We can implment rate limiting at 3 levels, rate limit at
 1. Web Server (Proxy/API Gateway)
     - Since, we are using Render, it directly proxies (manages webserver) requests to our backend
-    - This can be consider if we own the platform the service is deployed on
+    - Cloudflare WAF
 
 2. APIs
     - Having some sort of userId (the easiest is API keys), we want to be liberal and in some ways fair to users/services

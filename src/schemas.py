@@ -16,7 +16,7 @@ class MimeType(str, Enum):
     DOCX = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 
 
-class ResumeUploadPayload(BaseModel):
+class ResumeUploadRequest(BaseModel):
     filename: str = Field(min_length=1)
     size: int = Field(ge=VALID_FILE_SIZES["min"], le=VALID_FILE_SIZES["max"],)
     content_type: MimeType

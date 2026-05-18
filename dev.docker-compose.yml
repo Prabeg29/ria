@@ -86,6 +86,7 @@ services:
       - queue
     volumes:
       - ./src:/opt/app/src
+      - ./database:/opt/app/database:ro
       - ./pyproject.toml:/opt/app/pyproject.toml
       - ./uv.lock:/opt/app/uv.lock
     ports:
@@ -103,7 +104,8 @@ services:
     env_file:
      - .env
     volumes:
-      - ./src:/opt/app/src
+      - ./src:/opt/app/src:ro
+      - ./database:/opt/app/database:ro
       - ./pyproject.toml:/opt/app/pyproject.toml
       - ./uv.lock:/opt/app/uv.lock
     deploy:
