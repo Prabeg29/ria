@@ -1,4 +1,3 @@
-from dataclasses import dataclass
 from enum import Enum
 from uuid import UUID
 
@@ -26,8 +25,7 @@ class ResumeUploadCompleteRequest(BaseModel):
     resume_id: UUID
 
 
-@dataclass
-class ResumeAnalyzeSchema:
+class ResumeAnalyzeRequest(BaseModel):
     job_url: str
 
 

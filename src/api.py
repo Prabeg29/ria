@@ -23,7 +23,7 @@ from .jobs import (
 )
 from .models import Resume
 from .schemas import (
-    ResumeAnalyzeSchema,
+    ResumeAnalyzeRequest,
     ResumeUploadRequest,
     ResumeUploadCompleteRequest,
     ResumeUploadInitResponse,
@@ -225,13 +225,35 @@ async def update_resume(
     return {"message": "Resume sent for LLM parsing"}
 
 
-@router.post("/resumes/{resume_id}/analyze", status_code=status.HTTP_202_ACCEPTED)
+@router.post(
+    "/resumes/{resume_id}/analyze",
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="",
+    description="""""",
+)
+@rate_limiter.limit("2/minute")
 async def analyze_resume(
-    resume_id: str,
-    payload: ResumeAnalyzeSchema,
+    request: Request,
+    response: Response,
+    resume_id: uuid.UUID,
+    payload: ResumeAnalyzeRequest,
     db_conn=Depends(get_db_connection),
     scraper_registry=Depends(get_scraper_registry),
 ):
+    """
+    Args:
+        request: Request object from FastAPI, explicit declaration for SlowAPI
+        response: Response object from FastAPI, explicit declaration for SlowAPI
+        payload: The job url to analyze resume against
+        db_conn: The asynchronous database connection.
+        scraper_registry: Registry storing all scraper class, resolved to the one based on URL at run time
+
+    Returns:
+        Success message
+
+    Raises:
+        HTTPException 
+    """
     async with db_conn.cursor(row_factory=class_row(Resume)) as cur:
         await cur.execute(
             """
@@ -240,6 +262,7 @@ async def analyze_resume(
                     resumes.raw_text
                 FROM resumes
                 WHERE resumes.id = %s
+                AND resumes.raw_text IS NOT NULL;
             """,
             (resume_id,),
         )
@@ -271,7 +294,7 @@ async def analyze_resume(
                 DO UPDATE SET
                     status = 'queued',
                     updated_at = EXCLUDED.updated_at
-                    WHERE scraped_jobs.last_scraped_at < NOW() - INTERVAL '24 hours'
+                    WHERE scraped_jobs.last_scraped_at < NOW() - INTERVAL '72 hours'
                     AND scraped_jobs.is_archived = false
                     OR scraped_jobs.status NOT IN ('queued', 'scraping')
                 RETURNING id;
