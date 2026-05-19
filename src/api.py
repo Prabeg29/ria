@@ -164,8 +164,7 @@ async def update_resume(
         Success message
 
     Raises:
-        HTTPException: If the file has been previously dispatched for LLM extraction 
-        or if there was no upload.
+        HTTPException: If the file has been previously dispatched or if there was no upload.
     """
     async with db_conn.cursor() as aconn:
         await aconn.execute(
@@ -215,14 +214,18 @@ async def update_resume(
         params=(payload.resume_id,),
     )
     
-    extract_job = extract_resume_text.delay(resume_id) # type: ignore
+    extract_resume_text.delay(resume_id) # type: ignore
 
-    parse_resume_with_llm.delay( # type: ignore
-        resume_id,
-        depends_on=extract_job,
-    )
+    # On Date: 2026-05-19, cannot think of any feature how parsing the resume
+    # content as JSON would add any value. If you think this is required do
+    # update the rate limit for the endpoint
+    #
+    # parse_resume_with_llm.delay( # type: ignore
+    #     resume_id,
+    #     depends_on=extract_job,
+    # )
 
-    return {"message": "Resume sent for LLM parsing"}
+    return {"message": "Resume sent to extract raw text"}
 
 
 @router.post(

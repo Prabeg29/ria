@@ -246,7 +246,7 @@ async def parse_resume_with_llm(resume_id: uuid.UUID) -> None:
     "default",
     connection=settings.redis_conn,
     queue_class=CustomQueue,
-    retry=retry_with_exponential_backoff(3, initial=30),
+    retry=retry_with_exponential_backoff(3, initial=60),
     on_failure=handle_retry,
 )
 async def scrape_job_details(
