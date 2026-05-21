@@ -88,11 +88,11 @@ async def extract_resume_text(resume_id: uuid.UUID) -> None:
                     SELECT
                         resumes.id,
                         resumes.raw_text,
-                        resumes.s3_url,
-                        resumes.upload_status
+                        resumes.s3_key,
+                        resumes.processing_status
                     FROM resumes
                     WHERE resumes.id = %s
-                        AND resumes.upload_status = 'completed'
+                        AND resumes.upload_status = 's3_uploaded'
                         AND resumes.raw_text IS NULL
                     FOR UPDATE SKIP LOCKED;
                 """,
@@ -123,19 +123,21 @@ async def extract_resume_text(resume_id: uuid.UUID) -> None:
         )
 
         if not raw_text:
+            processing_failure_remarks = "Resume is empty after preprocessing — marking failed"
             logger.error(
-                "[extract_resume_text]: Resume is empty after preprocessing — marking failed",
+                f"[extract_resume_text]: {processing_failure_remarks}",
                 extra={"resume_id": resume_id},
             )
 
             await aconn.execute(
                 """
                     UPDATE ria.resumes
-                    SET upload_status = 'failed',
+                    SET processing_status = 'failed',
+                        processing_failure_remarks = %s
                         updated_at = NOW()
                     WHERE id = %s
                 """,
-                (resume.id,),
+                (processing_failure_remarks, resume.id,),
             )
 
             raise ValueError(f"Resume {resume_id} is empty after preprocessing")
@@ -144,13 +146,11 @@ async def extract_resume_text(resume_id: uuid.UUID) -> None:
             """
                 UPDATE resumes
                 SET raw_text = %s,
+                processing_status = 'raw_extracted',
                 updated_at = NOW()
                 WHERE id = %s
             """,
-            (
-                raw_text,
-                resume.id,
-            ),
+            (raw_text, resume.id,),
         )
 
 
@@ -172,7 +172,7 @@ async def parse_resume_with_llm(resume_id: uuid.UUID) -> None:
                     resumes.upload_status,
                 FROM resumes
                 WHERE resumes.id = %s
-                    AND resumes.upload_status = 'extracted'
+                    AND resumes.upload_status = 'raw_extracted'
                     AND resumes.parsed_data IS NULL
                 FOR UPDATE SKIP LOCKED;
             """,
@@ -205,10 +205,23 @@ async def parse_resume_with_llm(resume_id: uuid.UUID) -> None:
             raise
 
         if response.text is None:
+            processing_failure_remarks = "LLM returned empty response — marking failed"
             logger.error(
-                "[parse_resume_with_llm]: Gemini returned empty response",
+                f"[parse_resume_with_llm]: {processing_failure_remarks}",
                 extra={"resume_id": resume_id},
             )
+
+            await aconn.execute(
+                """
+                    UPDATE ria.resumes
+                    SET processing_status = 'failed',
+                        processing_failure_remarks = %s
+                        updated_at = NOW()
+                    WHERE id = %s
+                """,
+                (processing_failure_remarks, resume.id,),
+            )
+
             raise ValueError(f"Gemini returned no content for resume {resume_id}")
 
         try:
@@ -225,21 +238,13 @@ async def parse_resume_with_llm(resume_id: uuid.UUID) -> None:
             """
                 UPDATE resumes
                 SET parsed_data = %s,
-                    upload_status = 'parsed'
+                    upload_status = 'llm_parsed'
                     updated_at = NOW()
                 WHERE id = %s
-                    AND upload_status = 'extracted';
+                    AND upload_status = 'raw_extracted';
             """,
-            (
-                Json(parsed_data),
-                resume.id,
-            ),
+            (Json(parsed_data), resume.id,),
         )
-
-    logger.info(
-        f"[process_and_save_resume]: Updated resume with parsed data",
-        extra={"resume_id": resume_id,},
-    )
 
 
 @job(

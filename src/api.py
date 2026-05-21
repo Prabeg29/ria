@@ -89,7 +89,7 @@ async def upload_resume(
                     VALUES (%s, %s, %s, %s, NOW(), NOW())
                     ON CONFLICT (content_hash) DO UPDATE
                     SET updated_at = NOW()
-                    WHERE resumes.upload_status = 'pending'
+                    WHERE resumes.processing_status = 'pending'
                     AND (
                             resumes.last_upload_presigned_url_generated_at is NULL
                             OR
@@ -106,13 +106,15 @@ async def upload_resume(
             ),
         )
 
-        [resume_id, s3_key] = await cur.fetchone()
+        resume = await cur.fetchone()
 
-    if resume_id is None:
+    if resume is None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="File has been previously uploaded, skipping processing",
         )
+
+    [resume_id, s3_key] = resume
 
     url = s3_client.generate_presigned_post(
         Bucket=settings.aws_bucket,
@@ -171,10 +173,11 @@ async def update_resume(
             """
                 SELECT
                     resumes.id,
-                    resumes.s3_url,
-                    resumes.upload_status
+                    resumes.s3_key,
+                    resumes.processing_status
                 FROM resumes
                 WHERE resumes.id = %s
+                AND resume.processing_status NOT IN ("failed", "llm_parsed")
                 FOR UPDATE;
             """,
             (payload.resume_id,),
@@ -187,34 +190,35 @@ async def update_resume(
             detail=f"No resume found for id: {payload.resume_id}",
         )
     
-    [resume_id, s3_key, upload_status] = resume
+    [resume_id, s3_key, processing_status] = resume
     
-    if upload_status == "completed":
-        return {"message": "Already processed"}
+    if processing_status == 'pending':
+        try:
+            s3_client.head_object(Bucket=settings.aws_bucket, Key=s3_key)
 
-    try:
-        s3_client.head_object(Bucket=settings.aws_bucket, Key=s3_key)
-    except ClientError as exc:
-        error_code = exc.response["Error"]["Code"]
-        if error_code in ("404", "NoSuchKey"):
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail="File not found in S3 — the upload may not have completed.",
+            await db_conn.execute(
+                query="""
+                    UPDATE ria.resumes
+                    SET processing_status = 's3_uploaded',
+                        updated_at = NOW()
+                    WHERE id = %s;
+                """,
+                params=(payload.resume_id,),
             )
-        raise
+        except ClientError as exc:
+            error_code = exc.response["Error"]["Code"]
+            if error_code in ("404", "NoSuchKey"):
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="File not found in S3 — the upload may not have completed.",
+                )
+            raise
 
-    await db_conn.execute(
-        query="""
-            UPDATE ria.resumes
-            SET upload_status = 'completed',
-                updated_at = NOW()
-            WHERE id = %s
-            AND resumes.upload_status='pending';
-        """,
-        params=(payload.resume_id,),
+    extract_job = (
+        None
+        if processing_status == "raw_extracted" 
+        else extract_resume_text.delay(resume_id)  # type: ignore
     )
-    
-    extract_resume_text.delay(resume_id) # type: ignore
 
     # On Date: 2026-05-19, cannot think of any feature how parsing the resume
     # content as JSON would add any value. If you think this is required do
@@ -224,8 +228,7 @@ async def update_resume(
     #     resume_id,
     #     depends_on=extract_job,
     # )
-
-    return {"message": "Resume sent to extract raw text"}
+    return {"message": "Resume sent for further processing"}
 
 
 @router.post(
