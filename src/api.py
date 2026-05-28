@@ -40,11 +40,16 @@ router = APIRouter(prefix="")
     "/resumes/upload/init",
     response_model=ResumeUploadInitResponse,
     status_code=status.HTTP_200_OK,
-    summary="Initiates a resume upload by creating a record and generating an S3 URL.",
-    description="""Registers the resume metadata in the database using an upsert strategy on the
-    content hash. If the resume already exists and is not in a 'pending' state, or
-    if a presigned URL was generated recently, the request is rejected to prevent
-    duplicates."""
+    summary="Initiate a resume upload",
+    description="""Registers the resume metadata in the database using an upsert on the content hash
+    and returns an S3 presigned POST URL for the client to upload the file directly.
+
+    Deduplication: If a resume with the same content hash already exists and has moved past the
+    'pending' state, or a presigned URL was generated within the last 3 minutes, the request
+    is rejected with 400 to prevent duplicate uploads.
+
+    The presigned URL enforces a content-type match and a file size between 50 KB and 1 MB.
+    It expires after the configured TTL (aws_s3_presigned_url_expiresin).""",
 )
 @rate_limiter.limit("20/minute")
 async def upload_resume(
@@ -54,21 +59,6 @@ async def upload_resume(
     content_hash: str = Depends(verify_content_hash_header),
     db_conn=Depends(get_db_connection),
 ):
-    """
-    Args:
-        request: Request object from FastAPI, explicit declaration for SlowAPI
-        response: Response object from FastAPI, explicit declaration for SlowAPI
-        payload: The resume metadata including filename, size, and content type.
-        content_hash: The SHA-256 hash of the file content from the header.
-        db_conn: The asynchronous database connection.
-
-    Returns:
-        A dictionary containing the resume ID and the S3 presigned POST URL.
-
-    Raises:
-        HTTPException: If the file has been previously uploaded or if an upload
-            is already in progress for this content hash.
-    """
     resume = Resume(
         filename=payload.filename,
     )
@@ -143,10 +133,18 @@ async def upload_resume(
 @router.post(
     "/resumes/upload/complete",
     status_code=status.HTTP_202_ACCEPTED,
-    summary="Dispatches the resume uploaded for LLM extraction",
-    description="""Validates resumes upload through DB and S3 checks.
-    Dispatches the resumes with valid upload for LLM extraction
-    """
+    summary="Confirm upload and dispatch resume for text extraction",
+    description="""Called by the client after the file has been uploaded to S3 via the presigned URL.
+
+    Verification: Looks up the resume by ID, skipping any that are already in a terminal
+    state ('failed' or 'llm_parsed'). For resumes still in 'pending', an S3 HEAD check
+    confirms the object exists; if not, returns 422.
+
+    Dispatch: Once verified, the processing status is moved to 's3_uploaded' and the resume
+    is enqueued for raw text extraction (extract_resume_text). Resumes already at
+    'raw_extracted' skip the extraction step.
+
+    Returns 404 if no resume matches the given ID or all matching resumes are in terminal states.""",
 )
 @rate_limiter.limit("5/minute")
 async def update_resume(
@@ -155,19 +153,6 @@ async def update_resume(
     payload: ResumeUploadCompleteRequest,
     db_conn=Depends(get_db_connection),
 ):
-    """
-    Args:
-        request: Request object from FastAPI, explicit declaration for SlowAPI
-        response: Response object from FastAPI, explicit declaration for SlowAPI
-        payload: The resume metadata including id.
-        db_conn: The asynchronous database connection.
-
-    Returns:
-        Success message
-
-    Raises:
-        HTTPException: If the file has been previously dispatched or if there was no upload.
-    """
     async with db_conn.cursor() as aconn:
         await aconn.execute(
             """
@@ -234,10 +219,21 @@ async def update_resume(
 @router.post(
     "/resumes/{resume_id}/analyze",
     status_code=status.HTTP_202_ACCEPTED,
-    summary="",
-    description="""""",
+    summary="Analyze a resume against a job posting",
+    description="""Accepts a job URL, scrapes the posting (or reuses a recent scrape), and queues
+    an LLM analysis comparing the resume against the job requirements.
+
+    Scraping: The job URL is normalized and hashed. If no recent scrape exists (within 72 hours)
+    or the previous scrape is not currently in-flight, a new scrape job is dispatched via
+    Playwright. Otherwise the existing scraped data or in-progress job is reused.
+
+    Analysis: Once scraping completes (or is skipped), the ingress_llm job is enqueued with a
+    dependency on the scrape job. Results are streamed to the client via SSE on the
+    /analysis/{job_id}/stream endpoint.
+
+    Returns 404 if no resume with extracted text is found for the given ID.""",
 )
-@rate_limiter.limit("2/minute")
+# @rate_limiter.limit("2/minute")
 async def analyze_resume(
     request: Request,
     response: Response,
@@ -246,20 +242,6 @@ async def analyze_resume(
     db_conn=Depends(get_db_connection),
     scraper_registry=Depends(get_scraper_registry),
 ):
-    """
-    Args:
-        request: Request object from FastAPI, explicit declaration for SlowAPI
-        response: Response object from FastAPI, explicit declaration for SlowAPI
-        payload: The job url to analyze resume against
-        db_conn: The asynchronous database connection.
-        scraper_registry: Registry storing all scraper class, resolved to the one based on URL at run time
-
-    Returns:
-        Success message
-
-    Raises:
-        HTTPException 
-    """
     async with db_conn.cursor(row_factory=class_row(Resume)) as cur:
         await cur.execute(
             """
