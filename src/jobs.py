@@ -105,6 +105,7 @@ def handle_retry(job, connection, type, value, traceback):
         job.retries_left = 0
         job.retry_intervals = None
 
+
 @job(
     "default",
     connection=settings.redis_conn,
