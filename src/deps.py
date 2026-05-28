@@ -1,7 +1,44 @@
-from fastapi import Header, HTTPException, Request, status
+from fastapi import Depends, Header, HTTPException, Request, status
 
 from .database import db_conn
 from .job_scraper import ScraperRegistry
+from .utils import hash_url
+
+
+async def get_db_connection():
+    async with db_conn() as conn:
+        yield conn
+
+
+async def get_api_key(
+    x_api_key: str | None = Header(default=None),
+    db_conn=Depends(get_db_connection)
+) -> str:
+    if x_api_key is None or x_api_key.strip() is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing required header: X-API-KEY",
+        )
+
+    async with db_conn.cursor() as cur:
+        await cur.execute(
+            """
+                SELECT key_hash
+                FROM ria.api_keys
+                WHERE key_hash = %s
+            """,
+            (hash_url(x_api_key),)
+        )
+
+        key_hash_db = await cur.fetchone()
+    
+    if key_hash_db is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid API Key",
+        )
+    
+    return x_api_key
 
 
 def verify_content_hash_header(
@@ -15,11 +52,6 @@ def verify_content_hash_header(
             detail="Missing required header: X-Content-Hash",
         )
     return x_content_hash.strip()
-
-
-async def get_db_connection():
-    async with db_conn() as conn:
-        yield conn
 
 
 def get_scraper_registry(request: Request) -> ScraperRegistry:
