@@ -2,7 +2,7 @@ import json
 import uuid
 
 from botocore.exceptions import ClientError
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.responses import StreamingResponse
 from psycopg import sql
 from psycopg.rows import class_row
@@ -23,14 +23,14 @@ from .jobs import (
 )
 from .models import Resume
 from .schemas import (
-    ResumeAnalyzeSchema,
-    ResumeUploadPayload,
-    ResumeUploadCompletePayload,
+    ResumeAnalyzeRequest,
+    ResumeUploadRequest,
+    ResumeUploadCompleteRequest,
     ResumeUploadInitResponse,
 )
 from .settings import settings
 from .redis import async_redis
-from .utils import hash_url, s3_client
+from .utils import hash_url, rate_limiter, s3_client
 
 
 router = APIRouter(prefix="")
@@ -40,30 +40,25 @@ router = APIRouter(prefix="")
     "/resumes/upload/init",
     response_model=ResumeUploadInitResponse,
     status_code=status.HTTP_200_OK,
-    summary="Initiates a resume upload by creating a record and generating an S3 URL.",
-    description="""Registers the resume metadata in the database using an upsert strategy on the
-    content hash. If the resume already exists and is not in a 'pending' state, or
-    if a presigned URL was generated recently, the request is rejected to prevent
-    duplicates."""
+    summary="Initiate a resume upload",
+    description="""Registers the resume metadata in the database using an upsert on the content hash
+    and returns an S3 presigned POST URL for the client to upload the file directly.
+
+    Deduplication: If a resume with the same content hash already exists and has moved past the
+    'pending' state, or a presigned URL was generated within the last 3 minutes, the request
+    is rejected with 400 to prevent duplicate uploads.
+
+    The presigned URL enforces a content-type match and a file size between 50 KB and 1 MB.
+    It expires after the configured TTL (aws_s3_presigned_url_expiresin).""",
 )
+@rate_limiter.limit("20/minute")
 async def upload_resume(
-    payload: ResumeUploadPayload,
+    request: Request,
+    response: Response,
+    payload: ResumeUploadRequest,
     content_hash: str = Depends(verify_content_hash_header),
     db_conn=Depends(get_db_connection),
 ):
-    """
-    Args:
-        payload: The resume metadata including filename and content type.
-        content_hash: The SHA-256 hash of the file content from the header.
-        db_conn: The asynchronous database connection.
-
-    Returns:
-        A dictionary containing the resume ID and the S3 presigned POST URL.
-
-    Raises:
-        HTTPException: If the file has been previously uploaded or if an upload
-            is already in progress for this content hash.
-    """
     resume = Resume(
         filename=payload.filename,
     )
@@ -84,7 +79,7 @@ async def upload_resume(
                     VALUES (%s, %s, %s, %s, NOW(), NOW())
                     ON CONFLICT (content_hash) DO UPDATE
                     SET updated_at = NOW()
-                    WHERE resumes.upload_status = 'pending'
+                    WHERE resumes.processing_status = 'pending'
                     AND (
                             resumes.last_upload_presigned_url_generated_at is NULL
                             OR
@@ -101,17 +96,19 @@ async def upload_resume(
             ),
         )
 
-        row = await cur.fetchone()
+        resume = await cur.fetchone()
 
-    if row is None:
+    if resume is None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="File has been previously uploaded, skipping processing",
         )
 
+    [resume_id, s3_key] = resume
+
     url = s3_client.generate_presigned_post(
         Bucket=settings.aws_bucket,
-        Key=row[1],
+        Key=s3_key,
         Fields={"Content-Type": payload.content_type},
         Conditions=[
             ["eq", "$Content-Type", payload.content_type],
@@ -130,42 +127,42 @@ async def upload_resume(
         params=(content_hash,),
     )
 
-    return ResumeUploadInitResponse(id=row[0], upload_url=url)
+    return ResumeUploadInitResponse(id=resume_id, upload_url=url)
 
 
 @router.post(
     "/resumes/upload/complete",
     status_code=status.HTTP_202_ACCEPTED,
-    summary="Dispatches the resume uploaded for LLM extraction",
-    description="""Validates resumes upload through DB and S3 checks.
-    Dispatches the resumes with valid upload for LLM extraction
-    """
+    summary="Confirm upload and dispatch resume for text extraction",
+    description="""Called by the client after the file has been uploaded to S3 via the presigned URL.
+
+    Verification: Looks up the resume by ID, skipping any that are already in a terminal
+    state ('failed' or 'llm_parsed'). For resumes still in 'pending', an S3 HEAD check
+    confirms the object exists; if not, returns 422.
+
+    Dispatch: Once verified, the processing status is moved to 's3_uploaded' and the resume
+    is enqueued for raw text extraction (extract_resume_text). Resumes already at
+    'raw_extracted' skip the extraction step.
+
+    Returns 404 if no resume matches the given ID or all matching resumes are in terminal states.""",
 )
+@rate_limiter.limit("5/minute")
 async def update_resume(
-    payload: ResumeUploadCompletePayload,
+    request: Request,
+    response: Response,
+    payload: ResumeUploadCompleteRequest,
     db_conn=Depends(get_db_connection),
 ):
-    """
-    Args:
-        payload: The resume metadata including id.
-        db_conn: The asynchronous database connection.
-
-    Returns:
-        Success message
-
-    Raises:
-        HTTPException: If the file has been previously dispatched for LLM extraction 
-        or if there was no upload.
-    """
     async with db_conn.cursor() as aconn:
         await aconn.execute(
             """
                 SELECT
                     resumes.id,
-                    resumes.s3_url,
-                    resumes.upload_status
+                    resumes.s3_key,
+                    resumes.processing_status
                 FROM resumes
                 WHERE resumes.id = %s
+                AND resume.processing_status NOT IN ("failed", "llm_parsed")
                 FOR UPDATE;
             """,
             (payload.resume_id,),
@@ -178,57 +175,70 @@ async def update_resume(
             detail=f"No resume found for id: {payload.resume_id}",
         )
     
-    if resume[2] == "completed":
-        return {"message": "Already processed"}
-
-    try:
-        s3_client.head_object(Bucket=settings.aws_bucket, Key=resume[1])
-    except ClientError as exc:
-        error_code = exc.response["Error"]["Code"]
-        if error_code in ("404", "NoSuchKey"):
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail="File not found in S3 — the upload may not have completed.",
-            )
-        raise
-
-    async with db_conn.cursor() as cur:
-        await cur.execute(
-            query="""
-                UPDATE ria.resumes
-                SET upload_status = 'completed',
-                    updated_at = NOW()
-                WHERE id = %s
-                AND resumes.upload_status='pending'
-                RETURNING id;
-            """,
-            params=(payload.resume_id,),
-        )
-
-        updated = await cur.fetchone()
-
-    if updated is None:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Resume was already marked as completed.",
-        )
+    [resume_id, s3_key, processing_status] = resume
     
-    extract_job = extract_resume_text.delay(updated[0]) # type: ignore
+    if processing_status == 'pending':
+        try:
+            s3_client.head_object(Bucket=settings.aws_bucket, Key=s3_key)
 
-    parse_resume_with_llm.delay( # type: ignore
-        updated[0],
-        depends_on=extract_job,
+            await db_conn.execute(
+                query="""
+                    UPDATE ria.resumes
+                    SET processing_status = 's3_uploaded',
+                        updated_at = NOW()
+                    WHERE id = %s;
+                """,
+                params=(payload.resume_id,),
+            )
+        except ClientError as exc:
+            error_code = exc.response["Error"]["Code"]
+            if error_code in ("404", "NoSuchKey"):
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="File not found in S3 — the upload may not have completed.",
+                )
+            raise
+
+    extract_job = (
+        None
+        if processing_status == "raw_extracted" 
+        else extract_resume_text.delay(resume_id)  # type: ignore
     )
 
-    process_and_save_resume.delay(payload.resume_id)  # type: ignore
+    # On Date: 2026-05-19, cannot think of any feature how parsing the resume
+    # content as JSON would add any value. If you think this is required do
+    # update the rate limit for the endpoint
+    #
+    # parse_resume_with_llm.delay( # type: ignore
+    #     resume_id,
+    #     depends_on=extract_job,
+    # )
+    return {"message": "Resume sent for further processing"}
 
-    return {"message": "Resume sent for LLM parsing"}
 
+@router.post(
+    "/resumes/{resume_id}/analyze",
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Analyze a resume against a job posting",
+    description="""Accepts a job URL, scrapes the posting (or reuses a recent scrape), and queues
+    an LLM analysis comparing the resume against the job requirements.
 
-@router.post("/resumes/{resume_id}/analyze", status_code=status.HTTP_202_ACCEPTED)
+    Scraping: The job URL is normalized and hashed. If no recent scrape exists (within 72 hours)
+    or the previous scrape is not currently in-flight, a new scrape job is dispatched via
+    Playwright. Otherwise the existing scraped data or in-progress job is reused.
+
+    Analysis: Once scraping completes (or is skipped), the ingress_llm job is enqueued with a
+    dependency on the scrape job. Results are streamed to the client via SSE on the
+    /analysis/{job_id}/stream endpoint.
+
+    Returns 404 if no resume with extracted text is found for the given ID.""",
+)
+# @rate_limiter.limit("2/minute")
 async def analyze_resume(
-    resume_id: str,
-    payload: ResumeAnalyzeSchema,
+    request: Request,
+    response: Response,
+    resume_id: uuid.UUID,
+    payload: ResumeAnalyzeRequest,
     db_conn=Depends(get_db_connection),
     scraper_registry=Depends(get_scraper_registry),
 ):
@@ -240,6 +250,7 @@ async def analyze_resume(
                     resumes.raw_text
                 FROM resumes
                 WHERE resumes.id = %s
+                AND resumes.raw_text IS NOT NULL;
             """,
             (resume_id,),
         )
@@ -271,7 +282,7 @@ async def analyze_resume(
                 DO UPDATE SET
                     status = 'queued',
                     updated_at = EXCLUDED.updated_at
-                    WHERE scraped_jobs.last_scraped_at < NOW() - INTERVAL '24 hours'
+                    WHERE scraped_jobs.last_scraped_at < NOW() - INTERVAL '72 hours'
                     AND scraped_jobs.is_archived = false
                     OR scraped_jobs.status NOT IN ('queued', 'scraping')
                 RETURNING id;

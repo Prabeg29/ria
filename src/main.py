@@ -6,13 +6,16 @@ from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI, Request, status
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
 
 from .api import router
 from .database import init_db
-from .deps import get_db_connection
+from .deps import get_api_key, get_db_connection
 from .job_scraper import ScraperRegistry, SeekJobScraper
 from .logger import REQUEST_ID_CTX, logger
 from .settings import settings
+from .utils import rate_limiter
 
 
 @asynccontextmanager
@@ -31,6 +34,8 @@ app = FastAPI(
     title=settings.app_name,
     lifespan=lifespan,
 )
+app.state.limiter = rate_limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)  # type: ignore
 
 app.add_middleware(GZipMiddleware, minimum_size=1000, compresslevel=5)
 
@@ -63,7 +68,7 @@ async def add_request_id(request: Request, call_next):
     return response
 
 
-app.include_router(router=router)
+app.include_router(router=router, dependencies=[Depends(get_api_key)])
 
 
 # --------------------------------------------------

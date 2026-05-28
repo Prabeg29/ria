@@ -3,11 +3,16 @@ import random
 import uuid
 
 import pymupdf
-
+from botocore.exceptions import (
+    ConnectionClosedError,
+    ConnectTimeoutError,
+    EndpointConnectionError,
+    ReadTimeoutError,
+)
 from fastapi import status
 from google import genai
 from google.genai.errors import ClientError, ServerError
-from playwright.async_api import async_playwright
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError, async_playwright
 from psycopg.rows import class_row
 from psycopg.types.json import Json
 from rq import Retry
@@ -69,9 +74,37 @@ def retry_with_exponential_backoff(
 # ----------------------------------------------------
 # Exit retry for non-transient exceptions
 # ----------------------------------------------------
+TRANSIENT_EXCEPTIONS = (
+    ServerError,
+    PlaywrightTimeoutError,
+    ConnectionError,
+    TimeoutError,
+    ConnectionClosedError,
+    ConnectTimeoutError,
+    EndpointConnectionError,
+    ReadTimeoutError,
+)
+
+
+def _is_transient(exc_type, exc_value):
+    if issubclass(exc_type, TRANSIENT_EXCEPTIONS):
+        return True
+
+    if issubclass(exc_type, ClientError) and getattr(exc_value, "code", None) == 429:
+        return True
+
+    return False
+
+
 def handle_retry(job, connection, type, value, traceback):
-    print(job.args)
-    print("type", type) # Exception is here
+    if not _is_transient(type, value):
+        logger.warning(
+            "Non-transient error, cancelling retries",
+            extra={"job_id": job.id, "error": str(value)},
+        )
+        job.retries_left = 0
+        job.retry_intervals = None
+
 
 @job(
     "default",
@@ -88,11 +121,11 @@ async def extract_resume_text(resume_id: uuid.UUID) -> None:
                     SELECT
                         resumes.id,
                         resumes.raw_text,
-                        resumes.s3_url,
-                        resumes.upload_status
+                        resumes.s3_key,
+                        resumes.processing_status
                     FROM resumes
                     WHERE resumes.id = %s
-                        AND resumes.upload_status = 'completed'
+                        AND resumes.upload_status = 's3_uploaded'
                         AND resumes.raw_text IS NULL
                     FOR UPDATE SKIP LOCKED;
                 """,
@@ -123,19 +156,21 @@ async def extract_resume_text(resume_id: uuid.UUID) -> None:
         )
 
         if not raw_text:
+            processing_failure_remarks = "Resume is empty after preprocessing — marking failed"
             logger.error(
-                "[extract_resume_text]: Resume is empty after preprocessing — marking failed",
+                f"[extract_resume_text]: {processing_failure_remarks}",
                 extra={"resume_id": resume_id},
             )
 
             await aconn.execute(
                 """
                     UPDATE ria.resumes
-                    SET upload_status = 'failed',
+                    SET processing_status = 'failed',
+                        processing_failure_remarks = %s
                         updated_at = NOW()
                     WHERE id = %s
                 """,
-                (resume.id,),
+                (processing_failure_remarks, resume.id,),
             )
 
             raise ValueError(f"Resume {resume_id} is empty after preprocessing")
@@ -144,13 +179,11 @@ async def extract_resume_text(resume_id: uuid.UUID) -> None:
             """
                 UPDATE resumes
                 SET raw_text = %s,
+                processing_status = 'raw_extracted',
                 updated_at = NOW()
                 WHERE id = %s
             """,
-            (
-                raw_text,
-                resume.id,
-            ),
+            (raw_text, resume.id,),
         )
 
 
@@ -172,7 +205,7 @@ async def parse_resume_with_llm(resume_id: uuid.UUID) -> None:
                     resumes.upload_status,
                 FROM resumes
                 WHERE resumes.id = %s
-                    AND resumes.upload_status = 'extracted'
+                    AND resumes.upload_status = 'raw_extracted'
                     AND resumes.parsed_data IS NULL
                 FOR UPDATE SKIP LOCKED;
             """,
@@ -205,10 +238,23 @@ async def parse_resume_with_llm(resume_id: uuid.UUID) -> None:
             raise
 
         if response.text is None:
+            processing_failure_remarks = "LLM returned empty response — marking failed"
             logger.error(
-                "[parse_resume_with_llm]: Gemini returned empty response",
+                f"[parse_resume_with_llm]: {processing_failure_remarks}",
                 extra={"resume_id": resume_id},
             )
+
+            await aconn.execute(
+                """
+                    UPDATE ria.resumes
+                    SET processing_status = 'failed',
+                        processing_failure_remarks = %s
+                        updated_at = NOW()
+                    WHERE id = %s
+                """,
+                (processing_failure_remarks, resume.id,),
+            )
+
             raise ValueError(f"Gemini returned no content for resume {resume_id}")
 
         try:
@@ -225,28 +271,20 @@ async def parse_resume_with_llm(resume_id: uuid.UUID) -> None:
             """
                 UPDATE resumes
                 SET parsed_data = %s,
-                    upload_status = 'parsed'
+                    upload_status = 'llm_parsed'
                     updated_at = NOW()
                 WHERE id = %s
-                    AND upload_status = 'extracted';
+                    AND upload_status = 'raw_extracted';
             """,
-            (
-                Json(parsed_data),
-                resume.id,
-            ),
+            (Json(parsed_data), resume.id,),
         )
-
-    logger.info(
-        f"[process_and_save_resume]: Updated resume with parsed data",
-        extra={"resume_id": resume_id,},
-    )
 
 
 @job(
     "default",
     connection=settings.redis_conn,
     queue_class=CustomQueue,
-    retry=retry_with_exponential_backoff(3, initial=30),
+    retry=retry_with_exponential_backoff(3, initial=60),
     on_failure=handle_retry,
 )
 async def scrape_job_details(

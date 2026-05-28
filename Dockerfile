@@ -15,7 +15,7 @@ WORKDIR /opt/app
 # Stage: uv-base
 FROM base AS uv-base
 
-COPY pyproject.toml ./
+COPY pyproject.toml uv.lock ./
 
 RUN pip install --no-cache-dir uv
 
@@ -26,7 +26,7 @@ RUN chown -R ${UID}:${GID} /opt/app
 
 USER ria
 
-RUN uv sync
+RUN uv sync --frozen
 
 # Stage: export-deps
 FROM uv-base AS export-deps

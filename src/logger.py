@@ -72,6 +72,7 @@ LOGGING_CONFIG = {
         "": {
             "level": settings.log_level,
             "handlers": ["queue_handler"],
+            "propogate": False,
         },
     },
 }

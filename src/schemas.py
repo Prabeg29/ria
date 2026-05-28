@@ -1,4 +1,3 @@
-from dataclasses import dataclass
 from enum import Enum
 from uuid import UUID
 
@@ -16,18 +15,17 @@ class MimeType(str, Enum):
     DOCX = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 
 
-class ResumeUploadPayload(BaseModel):
+class ResumeUploadRequest(BaseModel):
     filename: str = Field(min_length=1)
     size: int = Field(ge=VALID_FILE_SIZES["min"], le=VALID_FILE_SIZES["max"],)
     content_type: MimeType
 
 
-class ResumeUploadCompletePayload(BaseModel):
-    resume_id: str
+class ResumeUploadCompleteRequest(BaseModel):
+    resume_id: UUID
 
 
-@dataclass
-class ResumeAnalyzeSchema:
+class ResumeAnalyzeRequest(BaseModel):
     job_url: str
 
 
