@@ -42,7 +42,7 @@ CREATE TABLE IF NOT EXISTS ria.scraped_jobs(
     last_scraped_at TIMESTAMP,
     is_archived BOOLEAN DEFAULT false,
     created_at TIMESTAMP DEFAULT NOW() NOT NULL,
-    updated_at TIMESTAMP DEFAULT NOW () NOT NULL,
+    updated_at TIMESTAMP DEFAULT NOW () NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS ix_ria_scraped_jobs_id ON ria.scraped_jobs (id);
