@@ -3,11 +3,16 @@ import random
 import uuid
 
 import pymupdf
-
+from botocore.exceptions import (
+    ConnectionClosedError,
+    ConnectTimeoutError,
+    EndpointConnectionError,
+    ReadTimeoutError,
+)
 from fastapi import status
 from google import genai
 from google.genai.errors import ClientError, ServerError
-from playwright.async_api import async_playwright
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError, async_playwright
 from psycopg.rows import class_row
 from psycopg.types.json import Json
 from rq import Retry
@@ -69,9 +74,36 @@ def retry_with_exponential_backoff(
 # ----------------------------------------------------
 # Exit retry for non-transient exceptions
 # ----------------------------------------------------
+TRANSIENT_EXCEPTIONS = (
+    ServerError,
+    PlaywrightTimeoutError,
+    ConnectionError,
+    TimeoutError,
+    ConnectionClosedError,
+    ConnectTimeoutError,
+    EndpointConnectionError,
+    ReadTimeoutError,
+)
+
+
+def _is_transient(exc_type, exc_value):
+    if issubclass(exc_type, TRANSIENT_EXCEPTIONS):
+        return True
+
+    if issubclass(exc_type, ClientError) and getattr(exc_value, "code", None) == 429:
+        return True
+
+    return False
+
+
 def handle_retry(job, connection, type, value, traceback):
-    print(job.args)
-    print("type", type) # Exception is here
+    if not _is_transient(type, value):
+        logger.warning(
+            "Non-transient error, cancelling retries",
+            extra={"job_id": job.id, "error": str(value)},
+        )
+        job.retries_left = 0
+        job.retry_intervals = None
 
 @job(
     "default",
