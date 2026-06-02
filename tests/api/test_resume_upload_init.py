@@ -111,5 +111,5 @@ def test_reupload_rejected_when_presigned_url_recently_generated(
     assert response.status_code == status.HTTP_400_BAD_REQUEST
     assert (
         response.json()["detail"]
-        == "File has been previously uploaded, skipping processing"
+        == "File has been previously uploaded, skipping processin"
     )
