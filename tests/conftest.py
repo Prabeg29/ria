@@ -6,13 +6,18 @@ from collections.abc import Generator
 import pytest
 from fastapi.testclient import TestClient
 
-from src.database import db_conn
+from src.database import db_conn, init_db
 from src.main import app
 from src.utils import hash_url
 
 
+@pytest.fixture(scope="session", autouse=True)
+def setup_database() -> None:
+    asyncio.run(init_db())
+
+
 @pytest.fixture(scope="session")
-def api_key() -> Generator[str, None, None]:
+def api_key(setup_database: None) -> Generator[str, None, None]:
     key = secrets.token_urlsafe(32)
     tenant_id = uuid.uuid4()
     api_key_id = uuid.uuid4()
