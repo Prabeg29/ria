@@ -86,6 +86,7 @@ services:
       - queue
     volumes:
       - ./src:/opt/app/src
+      - ./tests:/opt/app/tests
       - ./database:/opt/app/database:ro
       - ./pyproject.toml:/opt/app/pyproject.toml
       - ./uv.lock:/opt/app/uv.lock
