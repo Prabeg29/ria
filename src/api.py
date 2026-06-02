@@ -63,7 +63,7 @@ async def upload_resume(
     resume = Resume(
         filename=payload.filename,
     )
-    resume.s3_url = f"resumes/{resume.id}-{payload.filename}"
+    resume.s3_key = f"resumes/{resume.id}-{payload.filename}"
 
     async with db_conn.cursor() as cur:
         await cur.execute(
@@ -73,7 +73,7 @@ async def upload_resume(
                         id,
                         filename,
                         content_hash,
-                        s3_url,
+                        s3_key,
                         created_at,
                         updated_at
                     )
@@ -86,14 +86,14 @@ async def upload_resume(
                             OR
                             resumes.last_upload_presigned_url_generated_at < NOW() - INTERVAL '3 minutes'
                         )
-                    RETURNING id, s3_url;
+                    RETURNING id, s3_key;
                 """
             ),
             (
                 resume.id,
                 resume.filename,
                 content_hash,
-                resume.s3_url,
+                resume.s3_key,
             ),
         )
 
