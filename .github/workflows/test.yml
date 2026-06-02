@@ -47,10 +47,10 @@ jobs:
           DB_PASSWORD: ria
           REDIS_HOST: localhost
           REDIS_PORT: 6379
-          GEMINI_API_KEY="YOUR_GEMINI_API_KEY"
-          GEMINI_MODEL="gemini-pro" # Or gemini-2.5-flash
-          AWS_ACCESS_KEY_ID="YOUR_AWS_ACCESS_KEY_ID"
-          AWS_SECRET_ACCESS_KEY="YOUR_AWS_ACCESS_KEY"
-          AWS_DEFAULT_REGION="ap-southeast-2" # Your preferred AWS region
-          AWS_BUCKET="your-s3-bucket-name"
+          GEMINI_API_KEY: "YOUR_GEMINI_API_KEY"
+          GEMINI_MODEL: "gemini-pro" # Or gemini-2.5-flash
+          AWS_ACCESS_KEY_ID: "YOUR_AWS_ACCESS_KEY_ID"
+          AWS_SECRET_ACCESS_KEY: "YOUR_AWS_ACCESS_KEY"
+          AWS_DEFAULT_REGION: "ap-southeast-2" # Your preferred AWS region
+          AWS_BUCKET: "your-s3-bucket-name"
         run: uv run pytest tests/ -v
