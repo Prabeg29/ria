@@ -40,6 +40,7 @@ router = APIRouter(prefix="")
     "/resumes/upload/init",
     response_model=ResumeUploadInitResponse,
     status_code=status.HTTP_200_OK,
+    dependencies=[Depends(verify_content_hash_header)],
     summary="Initiate a resume upload",
     description="""Registers the resume metadata in the database using an upsert on the content hash
     and returns an S3 presigned POST URL for the client to upload the file directly.

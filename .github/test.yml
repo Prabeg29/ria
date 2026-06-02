@@ -1,0 +1,48 @@
+name: Test
+
+
+on:
+  pull_request:
+    types:
+      - opened
+
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    env:
+      DB_USERNAME: ria
+      DB_PASSWORD: ria
+      DB_DATABASE: ria
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+
+      - name: Install Python 3.13
+        run: uv python Install 3.13
+
+      - name: Install dependencies
+        run: uv sync --group dev
+
+      - name: Start services
+        run: docker-compose -f dev.docker-compose.yml up -d db queue --wait
+
+      - name: Run tests
+        env:
+          APP_NAME: ria
+          DB_HOST: localhost
+          DB_PORT: 5430
+          DB_DATABASE: ria
+          DB_PGSCHEMA: ria
+          DB_USERNAME: ria
+          DB_PASSWORD: ria
+          REDIS_HOST: localhost
+          REDIS_PORT: 6379
+        run: uv run pytest tests/ -v
