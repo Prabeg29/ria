@@ -30,7 +30,7 @@ def test_upload_rejected_for_invalid_content_type(client: TestClient) -> None:
         },
     )
 
-    assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
+    assert response.status_code == status.HTTP_422_UNPROCESSABLE_CONTENT
 
 
 def test_upload_rejected_for_invalid_file_size(client: TestClient) -> None:
@@ -48,7 +48,7 @@ def test_upload_rejected_for_invalid_file_size(client: TestClient) -> None:
         },
     )
 
-    assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
+    assert response.status_code == status.HTTP_422_UNPROCESSABLE_CONTENT
 
 
 def test_reupload_rejected_when_presigned_url_recently_generated(
@@ -128,10 +128,6 @@ def test_presigned_url_is_generated_new_content_hash(client: TestClient) -> None
         },
     )
 
-    data = response.json()
-
-    print(data)
-
     assert response.status_code == status.HTTP_200_OK
 
 
@@ -173,7 +169,6 @@ def test_presigned_url_is_generated_for_old_content_hash_after_3_mins(client: Te
     asyncio.run(_seed())
 
     try:
-        # Act: request a new upload for the same content hash.
         response = client.post(
             "/resumes/upload/init",
             headers={"X-Content-Hash": content_hash},
@@ -186,5 +181,4 @@ def test_presigned_url_is_generated_for_old_content_hash_after_3_mins(client: Te
     finally:
         asyncio.run(_teardown())
 
-    # Assert: the duplicate upload is rejected.
     assert response.status_code == status.HTTP_200_OK
