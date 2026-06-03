@@ -163,7 +163,7 @@ async def update_resume(
                     resumes.processing_status
                 FROM resumes
                 WHERE resumes.id = %s
-                AND resume.processing_status NOT IN ("failed", "llm_parsed")
+                AND resumes.processing_status NOT IN ('failed', 'llm_parsed')
                 FOR UPDATE;
             """,
             (payload.resume_id,),
