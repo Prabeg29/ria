@@ -195,7 +195,7 @@ async def update_resume(
             error_code = exc.response["Error"]["Code"]
             if error_code in ("404", "NoSuchKey"):
                 raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                     detail="File not found in S3 — the upload may not have completed.",
                 )
             raise
