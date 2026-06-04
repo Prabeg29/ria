@@ -113,6 +113,32 @@ def test_trigger_is_rejected_for_processing_status_llm_parsed(
     assert response.status_code == status.HTTP_404_NOT_FOUND
 
 
+def test_s3_object_is_skipped_for_processing_status_s3_uploaded(
+    client: TestClient,
+    seed_resume: Callable[[str], SeededResume],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 's3_uploaded' resume must not trigger an S3 HEAD check to confirm the uploaded
+    object exists before the resume is dispatched for further processing."""
+    resume = seed_resume("s3_uploaded")
+
+    mock_s3_client = MagicMock()
+    mock_extract_resume_text = MagicMock()
+    monkeypatch.setattr("src.api.s3_client", mock_s3_client)
+    monkeypatch.setattr("src.api.extract_resume_text", mock_extract_resume_text)
+
+    response = client.post(
+        "/resumes/upload/complete",
+        json={
+            "resume_id": resume.id
+        },
+    )
+
+    assert response.status_code == status.HTTP_202_ACCEPTED
+    mock_s3_client.head_object.assert_not_called()
+    mock_extract_resume_text.delay.assert_called_once_with(uuid.UUID(resume.id))
+
+
 def test_s3_object_is_checked_for_processing_status_pending(
     client: TestClient,
     seed_resume: Callable[[str], SeededResume],
