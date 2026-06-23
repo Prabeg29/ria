@@ -234,7 +234,7 @@ async def update_resume(
 
     Returns 404 if no resume with extracted text is found for the given ID.""",
 )
-# @rate_limiter.limit("2/minute")
+@rate_limiter.limit("2/minute")
 async def analyze_resume(
     request: Request,
     response: Response,
@@ -285,7 +285,7 @@ async def analyze_resume(
                     updated_at = EXCLUDED.updated_at
                     WHERE scraped_jobs.last_scraped_at < NOW() - INTERVAL '72 hours'
                     AND scraped_jobs.is_archived = false
-                    OR scraped_jobs.status NOT IN ('queued', 'scraping')
+                    AND scraped_jobs.status NOT IN ('queued', 'scraping')
                 RETURNING id;
             """,
             params=(str(uuid.uuid4()), normalized_url, url_hash),

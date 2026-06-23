@@ -1,7 +1,7 @@
 from enum import Enum
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 VALID_FILE_SIZES = {
@@ -27,6 +27,14 @@ class ResumeUploadCompleteRequest(BaseModel):
 
 class ResumeAnalyzeRequest(BaseModel):
     job_url: str
+
+    @field_validator("job_url")
+    @classmethod
+    def job_url_must_have_registered_scraper(cls, v: str) -> str:
+        from .job_scraper import ScraperRegistry
+
+        ScraperRegistry.resolve(v)
+        return v
 
 
 class S3PresignedPost(BaseModel):

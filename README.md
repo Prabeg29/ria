@@ -1,6 +1,13 @@
 # Resume Intelligence API
 
+Reviewing a job posting that looks promising shouldn't mean opening a web chat, copying the job description, uploading your resume, and starting over for every new role. RIA handles this: paste a job posting URL, and it scrapes the posting, runs an LLM analysis against your resume, and streams the result back — no copy-paste, no repeated uploads, no manual tracking in a chat window.
+
 ## Features
+
+- **Resume upload** via S3 presigned URL, with content-hash deduplication — the same file is processed exactly once regardless of how many times it is uploaded
+- **Job posting scraping** from URL — extensible scraper architecture; currently supports seek.com.au, with planned support for Ashby, Greenhouse, Lever, Blackbird, and OIF
+- **LLM-powered analysis** streamed in real time via SSE, comparing your resume against the scraped job posting
+- **Per-tenant API key auth** and per-endpoint rate limiting
 
 ## Project Structure
 ```console
