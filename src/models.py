@@ -54,7 +54,7 @@ class Resume(BaseModel, SoftDeleteMixin):
     filename: str = ""
     raw_text: str | None = None
     parsed_data: dict[str, Any] = field(default_factory=dict)
-    s3_url: str | None = None
+    s3_key: str | None = None
 
 
 # ---------------------------

@@ -63,7 +63,7 @@ async def upload_resume(
     resume = Resume(
         filename=payload.filename,
     )
-    resume.s3_url = f"resumes/{resume.id}-{payload.filename}"
+    resume.s3_key = f"resumes/{resume.id}-{payload.filename}"
 
     async with db_conn.cursor() as cur:
         await cur.execute(
@@ -73,7 +73,7 @@ async def upload_resume(
                         id,
                         filename,
                         content_hash,
-                        s3_url,
+                        s3_key,
                         created_at,
                         updated_at
                     )
@@ -86,14 +86,14 @@ async def upload_resume(
                             OR
                             resumes.last_upload_presigned_url_generated_at < NOW() - INTERVAL '3 minutes'
                         )
-                    RETURNING id, s3_url;
+                    RETURNING id, s3_key;
                 """
             ),
             (
                 resume.id,
                 resume.filename,
                 content_hash,
-                resume.s3_url,
+                resume.s3_key,
             ),
         )
 
@@ -163,7 +163,7 @@ async def update_resume(
                     resumes.processing_status
                 FROM resumes
                 WHERE resumes.id = %s
-                AND resume.processing_status NOT IN ("failed", "llm_parsed")
+                AND resumes.processing_status NOT IN ('failed', 'llm_parsed')
                 FOR UPDATE;
             """,
             (payload.resume_id,),
@@ -195,7 +195,7 @@ async def update_resume(
             error_code = exc.response["Error"]["Code"]
             if error_code in ("404", "NoSuchKey"):
                 raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                     detail="File not found in S3 — the upload may not have completed.",
                 )
             raise
@@ -234,7 +234,7 @@ async def update_resume(
 
     Returns 404 if no resume with extracted text is found for the given ID.""",
 )
-# @rate_limiter.limit("2/minute")
+@rate_limiter.limit("2/minute")
 async def analyze_resume(
     request: Request,
     response: Response,
@@ -285,7 +285,7 @@ async def analyze_resume(
                     updated_at = EXCLUDED.updated_at
                     WHERE scraped_jobs.last_scraped_at < NOW() - INTERVAL '72 hours'
                     AND scraped_jobs.is_archived = false
-                    OR scraped_jobs.status NOT IN ('queued', 'scraping')
+                    AND scraped_jobs.status NOT IN ('queued', 'scraping')
                 RETURNING id;
             """,
             params=(str(uuid.uuid4()), normalized_url, url_hash),

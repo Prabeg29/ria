@@ -5,6 +5,8 @@ on:
   pull_request:
     types:
       - opened
+      - synchronize
+      - reopened
 
 
 jobs:
@@ -26,13 +28,13 @@ jobs:
           enable-cache: true
 
       - name: Install Python 3.13
-        run: uv python Install 3.13
+        run: uv python install 3.13
 
       - name: Install dependencies
         run: uv sync --group dev
 
       - name: Start services
-        run: docker-compose -f dev.docker-compose.yml up -d db queue --wait
+        run: docker compose -f dev.docker-compose.yml up -d db queue --wait
 
       - name: Run tests
         env:
@@ -45,4 +47,10 @@ jobs:
           DB_PASSWORD: ria
           REDIS_HOST: localhost
           REDIS_PORT: 6379
+          GEMINI_API_KEY: "YOUR_GEMINI_API_KEY"
+          GEMINI_MODEL: "gemini-pro" # Or gemini-2.5-flash
+          AWS_ACCESS_KEY_ID: "YOUR_AWS_ACCESS_KEY_ID"
+          AWS_SECRET_ACCESS_KEY: "YOUR_AWS_ACCESS_KEY"
+          AWS_DEFAULT_REGION: "ap-southeast-2" # Your preferred AWS region
+          AWS_BUCKET: "your-s3-bucket-name"
         run: uv run pytest tests/ -v

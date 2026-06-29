@@ -140,7 +140,7 @@ async def extract_resume_text(resume_id: uuid.UUID) -> None:
             )
             return
 
-        response = s3_client.get_object(Bucket=settings.aws_bucket, Key=resume.s3_url)
+        response = s3_client.get_object(Bucket=settings.aws_bucket, Key=resume.s3_key)
         file_content = response["Body"].read()
 
         with pymupdf.open(stream=file_content, filetype="pdf") as doc:

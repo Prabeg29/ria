@@ -26,4 +26,10 @@ black = "^25.11.0"
 [dependency-groups]
 dev = [
     "pytest>=9.0.3",
+    "fpdf2>=2.8.3",
+]
+
+[tool.pytest.ini_options]
+markers = [
+    "rate_limit: marks tests that require rate limiting to be active (deselect with '-m \"not rate_limit\"')",
 ]
