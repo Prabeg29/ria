@@ -3,6 +3,7 @@ import hashlib
 import secrets
 import uuid
 
+import pytest
 from fastapi import status
 from fastapi.testclient import TestClient
 
@@ -129,6 +130,49 @@ def test_presigned_url_is_generated_new_content_hash(client: TestClient) -> None
     )
 
     assert response.status_code == status.HTTP_200_OK
+
+
+@pytest.mark.rate_limit
+def test_upload_init_returns_429_beyond_20_requests_per_minute(
+    client: TestClient, flush_rate_limit: None
+) -> None:
+    """The 21st request within the fixed window must be rejected with 429;
+    the first 20 must pass through the limiter."""
+    # Arrange: unique content hashes so no request trips the duplicate-upload 400.
+    content_hashes = [
+        hashlib.sha256(secrets.token_bytes(32)).hexdigest() for _ in range(21)
+    ]
+
+    async def _teardown() -> None:
+        async with db_conn() as conn:
+            await conn.execute(
+                "DELETE FROM ria.resumes WHERE content_hash = ANY(%s);",
+                (content_hashes,),
+            )
+
+    try:
+        # Act
+        responses = [
+            client.post(
+                "/resumes/upload/init",
+                headers={"X-Content-Hash": content_hash},
+                json={
+                    "filename": "resume.pdf",
+                    "size": 1024,
+                    "content_type": "application/pdf",
+                },
+            )
+            for content_hash in content_hashes
+        ]
+    finally:
+        asyncio.run(_teardown())
+
+    # Assert
+    assert all(
+        response.status_code != status.HTTP_429_TOO_MANY_REQUESTS
+        for response in responses[:20]
+    )
+    assert responses[20].status_code == status.HTTP_429_TOO_MANY_REQUESTS
 
 
 def test_presigned_url_is_generated_for_old_content_hash_after_3_mins(client: TestClient) -> None:

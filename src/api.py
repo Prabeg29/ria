@@ -7,7 +7,7 @@ from fastapi.responses import StreamingResponse
 from psycopg import sql
 from psycopg.rows import class_row
 from rq.exceptions import NoSuchJobError
-from rq.job import Job
+from rq.job import Dependency, Job
 
 from .deps import (
     get_db_connection,
@@ -283,9 +283,18 @@ async def analyze_resume(
                 DO UPDATE SET
                     status = 'queued',
                     updated_at = EXCLUDED.updated_at
-                    WHERE scraped_jobs.last_scraped_at < NOW() - INTERVAL '72 hours'
-                    AND scraped_jobs.is_archived = false
-                    AND scraped_jobs.status NOT IN ('queued', 'scraping')
+                    WHERE scraped_jobs.is_archived = false
+                    AND (
+                        scraped_jobs.status = 'failed'
+                        OR (
+                            scraped_jobs.status = 'scraped'
+                            AND scraped_jobs.last_scraped_at < NOW() - INTERVAL '72 hours'
+                        )
+                        OR (
+                            scraped_jobs.status IN ('queued', 'scraping')
+                            AND scraped_jobs.updated_at < NOW() - INTERVAL '15 minutes'
+                        )
+                    )
                 RETURNING id;
             """,
             params=(str(uuid.uuid4()), normalized_url, url_hash),
@@ -328,7 +337,12 @@ async def analyze_resume(
     )
 
     ingress_llm.delay(  # type: ignore
-        REQUEST_ID_CTX.get(), resume.raw_text, url_hash, depends_on=scrape_job
+        REQUEST_ID_CTX.get(),
+        resume.raw_text,
+        url_hash,
+        depends_on=Dependency(jobs=[scrape_job], allow_failure=True)
+        if scrape_job
+        else None,
     )
 
     return {"status": "queued", "job_id": REQUEST_ID_CTX.get()}

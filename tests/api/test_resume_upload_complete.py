@@ -8,7 +8,7 @@ from fastapi import status
 from fastapi.testclient import TestClient
 
 from src.settings import settings
-from tests.api.conftest import SeededResume
+from tests.conftest import SeededResume
 
 
 def test_trigger_is_rejected_for_non_existing_id(client: TestClient) -> None:
@@ -143,3 +143,27 @@ def test_pending_resume_rejected_when_file_not_uploaded_to_s3(
         Key=resume.s3_key,
     )
     mock_extract_resume_text.delay.assert_not_called()
+
+
+@pytest.mark.rate_limit
+def test_upload_complete_returns_429_beyond_5_requests_per_minute(
+    client: TestClient, flush_rate_limit: None
+) -> None:
+    """The 6th request within the fixed window must be rejected with 429; the
+    first 5 must pass through the limiter (as 404s for unknown resume IDs,
+    which keeps the requests free of S3 and queue side effects)."""
+    # Act
+    responses = [
+        client.post(
+            "/resumes/upload/complete",
+            json={"resume_id": str(uuid.uuid4())},
+        )
+        for _ in range(6)
+    ]
+
+    # Assert
+    assert all(
+        response.status_code == status.HTTP_404_NOT_FOUND
+        for response in responses[:5]
+    )
+    assert responses[5].status_code == status.HTTP_429_TOO_MANY_REQUESTS
