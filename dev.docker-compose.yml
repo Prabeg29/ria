@@ -96,14 +96,30 @@ services:
     networks:
       - ria
 
-  worker:
+  worker_default:
+    image: ria/base
+    depends_on:
+      - pgbouncer
+      - queue
+    env_file:
+      - .env
+    volumes:
+      - ./src:/opt/app/src:ro
+      - ./database:/opt/app/database:ro
+      - ./pyproject.toml:/opt/app/pyproject.toml
+      - ./uv.lock:/opt/app/uv.lock
+    command: uv run rq worker -w src.worker.CustomWorker --verbose --with-scheduler default
+    networks:
+      - ria
+
+  worker_scraping:
     image: ria/base
     depends_on:
       - pgbouncer
       - queue
       - browserless
     env_file:
-     - .env
+      - .env
     volumes:
       - ./src:/opt/app/src:ro
       - ./database:/opt/app/database:ro
@@ -111,7 +127,25 @@ services:
       - ./uv.lock:/opt/app/uv.lock
     deploy:
       replicas: 3
-    command: uv run rq worker -w src.worker.CustomWorker --verbose --with-scheduler default
+    command: uv run rq worker -w src.worker.CustomWorker --verbose scraping_queue
+    networks:
+      - ria
+
+  worker_gemini:
+    image: ria/base
+    depends_on:
+      - pgbouncer
+      - queue
+    env_file:
+      - .env
+    volumes:
+      - ./src:/opt/app/src:ro
+      - ./database:/opt/app/database:ro
+      - ./pyproject.toml:/opt/app/pyproject.toml
+      - ./uv.lock:/opt/app/uv.lock
+    deploy:
+      replicas: 5
+    command: uv run rq worker -w src.worker.CustomWorker --verbose gemini_queue
     networks:
       - ria
 

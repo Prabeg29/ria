@@ -10,7 +10,7 @@ from rq.exceptions import NoSuchJobError
 
 from src.database import db_conn
 from src.utils import hash_url
-from tests.api.conftest import SeededResume
+from tests.conftest import SeededResume
 from tests.conftest import SeededScrapedJob
 
 pytestmark = pytest.mark.usefixtures("stub_scraper_registry")
@@ -121,6 +121,45 @@ def test_cached_job_posting_skips_scrape_dispatches_ingress(
     mock_scrape.delay.assert_not_called()
     mock_ingress.delay.assert_called_once()
     assert mock_ingress.delay.call_args.kwargs["depends_on"] is None
+
+
+@pytest.mark.rate_limit
+def test_analyze_returns_429_beyond_2_requests_per_minute(
+    client: TestClient,
+    seed_resume: Callable[[str, str | None], SeededResume],
+    seed_scraped_job: Callable[[str, str], SeededScrapedJob],
+    monkeypatch: pytest.MonkeyPatch,
+    flush_rate_limit: None,
+) -> None:
+    """The 3rd request within the fixed window must be rejected with 429; the
+    first 2 must dispatch successfully (cached Job Posting path, so no scrape
+    is enqueued and the seeded rows are torn down by their fixtures)."""
+    # Arrange
+    job_url = f"https://www.seek.com.au/job/ratelimit-{uuid.uuid4().hex[:8]}"
+    resume = seed_resume("raw_extracted", raw_text="Experienced software engineer")
+    seed_scraped_job(job_url, "scraped")
+
+    mock_job_cls = MagicMock()
+    mock_job_cls.fetch.side_effect = NoSuchJobError
+    monkeypatch.setattr("src.api.scrape_job_details", MagicMock())
+    monkeypatch.setattr("src.api.ingress_llm", MagicMock())
+    monkeypatch.setattr("src.api.Job", mock_job_cls)
+
+    # Act
+    responses = [
+        client.post(
+            f"/resumes/{resume.id}/analyze",
+            json={"job_url": job_url},
+        )
+        for _ in range(3)
+    ]
+
+    # Assert
+    assert all(
+        response.status_code == status.HTTP_202_ACCEPTED
+        for response in responses[:2]
+    )
+    assert responses[2].status_code == status.HTTP_429_TOO_MANY_REQUESTS
 
 
 def test_inflight_job_posting_skips_scrape_reuses_existing_job(

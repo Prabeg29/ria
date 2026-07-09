@@ -1,3 +1,4 @@
+import asyncio
 import json
 import random
 import uuid
@@ -21,7 +22,7 @@ from rq.queue import Queue
 from tenacity import (
     before_sleep_log,
     retry,
-    retry_if_result,
+    retry_if_exception,
     stop_after_attempt,
     wait_exponential,
 )
@@ -96,7 +97,7 @@ def _is_transient(exc_type, exc_value):
     return False
 
 
-def handle_retry(job, connection, type, value, traceback):
+def handle_retry(job, connection, type, value, traceback) -> None:
     if not _is_transient(type, value):
         logger.warning(
             "Non-transient error, cancelling retries",
@@ -104,6 +105,35 @@ def handle_retry(job, connection, type, value, traceback):
         )
         job.retries_left = 0
         job.retry_intervals = None
+        return
+
+    if not job.retries_left:
+        job.meta["requeueable"] = True
+        job.save_meta()
+
+
+def handle_scrape_failure(job, connection, type, value, traceback) -> None:
+    handle_retry(job, connection, type, value, traceback)
+
+    if job.retries_left:
+        return
+
+    url_hash = job.args[3]
+
+    async def _mark_failed() -> None:
+        async with db_conn() as aconn:
+            await aconn.execute(
+                query="""
+                    UPDATE ria.scraped_jobs
+                    SET status = 'failed',
+                        updated_at = NOW()
+                    WHERE url_hash = %s
+                        AND status IN ('queued', 'scraping');
+                """,
+                params=(url_hash,),
+            )
+
+    asyncio.run(_mark_failed())
 
 
 @job(
@@ -125,7 +155,7 @@ async def extract_resume_text(resume_id: uuid.UUID) -> None:
                         resumes.processing_status
                     FROM resumes
                     WHERE resumes.id = %s
-                        AND resumes.upload_status = 's3_uploaded'
+                        AND resumes.processing_status = 's3_uploaded'
                         AND resumes.raw_text IS NULL
                     FOR UPDATE SKIP LOCKED;
                 """,
@@ -166,12 +196,13 @@ async def extract_resume_text(resume_id: uuid.UUID) -> None:
                 """
                     UPDATE ria.resumes
                     SET processing_status = 'failed',
-                        processing_failure_remarks = %s
+                        processing_failure_remarks = %s,
                         updated_at = NOW()
                     WHERE id = %s
                 """,
                 (processing_failure_remarks, resume.id,),
             )
+            await aconn.commit()
 
             raise ValueError(f"Resume {resume_id} is empty after preprocessing")
 
@@ -281,14 +312,17 @@ async def parse_resume_with_llm(resume_id: uuid.UUID) -> None:
 
 
 @job(
-    "default",
+    "scraping_queue",
     connection=settings.redis_conn,
     queue_class=CustomQueue,
     retry=retry_with_exponential_backoff(3, initial=60),
-    on_failure=handle_retry,
+    on_failure=handle_scrape_failure,
 )
 async def scrape_job_details(
-    request_id: str, job_scraper: JobScraper, normalized_url: str, url_hash: str
+    request_id: str,
+    job_scraper: JobScraper,
+    normalized_url: str,
+    url_hash: str
 ) -> None:
     await publish(
         request_id, "status", {"status": "scraping", "message": "Accessing job url..."}
@@ -360,24 +394,13 @@ async def scrape_job_details(
                 )
         except Exception:
             logger.info(
-                "Scraping job details failed",
+                "[scrape_job_details]: Scraping job details failed",
                 exc_info=True,
                 extra={
                     "normalized_job_url": normalized_url,
                     "url_hash": url_hash,
                 },
             )
-            async with db_conn() as aconn:
-                await aconn.execute(
-                    query="""
-                        UPDATE ria.scraped_jobs
-                        SET status = 'failed',
-                            last_scraped_at = NOW(),
-                            updated_at = NOW()
-                        WHERE url_hash = %s;
-                    """,
-                    params=(url_hash,),
-                )
             raise
         finally:
             await browser.close()
@@ -394,7 +417,7 @@ def is_retryable_error(e: Exception) -> bool:
 
 
 @retry(
-    retry=retry_if_result(is_retryable_error),
+    retry=retry_if_exception(is_retryable_error),
     stop=stop_after_attempt(5),
     wait=wait_exponential(multiplier=2, min=4, max=60),
     before_sleep=before_sleep_log(logger, 40),
@@ -409,7 +432,7 @@ async def ingest_llm(resume_text: str, job_data):
 
 
 @job(
-    "default",
+    "gemini_queue",
     connection=settings.redis_conn,
     queue_class=CustomQueue,
     retry=retry_with_exponential_backoff(3, initial=30),
@@ -444,7 +467,7 @@ async def ingress_llm(request_id: str, resume_text: str, url_hash: str):
                     WHERE scraped_jobs.url_hash = %s
                     AND scraped_jobs.status = 'scraped'
                     AND scraped_jobs.is_archived = false
-                    AND scraped_jobs.last_scraped_at > NOW() - INTERVAL '24 hours'
+                    AND scraped_jobs.last_scraped_at > NOW() - INTERVAL '72 hours'
                 """,
                     (url_hash,),
                 )
@@ -457,7 +480,11 @@ async def ingress_llm(request_id: str, resume_text: str, url_hash: str):
                     "url_hash": url_hash,
                 },
             )
-            await publish(request_id, "done", {"status": "complete"})
+            await publish(
+                request_id,
+                "done",
+                {"status": "failed", "message": "Job details unavailable"},
+            )
             return
 
         response_stream = await ingest_llm(
