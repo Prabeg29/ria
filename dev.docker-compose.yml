@@ -69,7 +69,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      target: dev
+      target: runner
       args:
         - UID=${UID:-1000}
         - GID=${GID:-1000}
@@ -92,7 +92,7 @@ services:
       - ./uv.lock:/opt/app/uv.lock
     ports:
       - 8000:8000
-    command: uv run uvicorn src.main:app --host 0.0.0.0 --port 8000 --reload
+    command:  uvicorn src.main:app --host 0.0.0.0 --port 8000 --reload
     networks:
       - ria
 
@@ -108,7 +108,7 @@ services:
       - ./database:/opt/app/database:ro
       - ./pyproject.toml:/opt/app/pyproject.toml
       - ./uv.lock:/opt/app/uv.lock
-    command: uv run rq worker -w src.worker.CustomWorker --verbose --with-scheduler default
+    command: rq worker -w src.worker.CustomWorker --verbose --with-scheduler default
     networks:
       - ria
 
@@ -127,7 +127,7 @@ services:
       - ./uv.lock:/opt/app/uv.lock
     deploy:
       replicas: 3
-    command: uv run rq worker -w src.worker.CustomWorker --verbose scraping_queue
+    command: rq worker -w src.worker.CustomWorker --verbose scraping_queue
     networks:
       - ria
 
@@ -145,7 +145,7 @@ services:
       - ./uv.lock:/opt/app/uv.lock
     deploy:
       replicas: 5
-    command: uv run rq worker -w src.worker.CustomWorker --verbose gemini_queue
+    command: rq worker -w src.worker.CustomWorker --verbose gemini_queue
     networks:
       - ria
 
