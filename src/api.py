@@ -84,7 +84,7 @@ async def upload_resume(
                     AND (
                             resumes.last_upload_presigned_url_generated_at is NULL
                             OR
-                            resumes.last_upload_presigned_url_generated_at < NOW() - INTERVAL '3 minutes'
+                            resumes.last_upload_presigned_url_generated_at < NOW() - INTERVAL '%s'
                         )
                     RETURNING id, s3_key;
                 """
@@ -94,6 +94,7 @@ async def upload_resume(
                 resume.filename,
                 content_hash,
                 resume.s3_key,
+                settings.aws_s3_presigned_url_expiresin
             ),
         )
 
