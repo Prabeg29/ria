@@ -64,6 +64,7 @@ def test_fresh_job_posting_dispatches_scrape_and_ingress(
     resume = seed_resume("raw_extracted", raw_text="Experienced software engineer")
 
     mock_scrape = MagicMock()
+    mock_scrape.delay.return_value = "scrape-job-id"
     mock_ingress = MagicMock()
     monkeypatch.setattr("src.api.scrape_job_details", mock_scrape)
     monkeypatch.setattr("src.api.ingress_llm", mock_ingress)
@@ -78,7 +79,10 @@ def test_fresh_job_posting_dispatches_scrape_and_ingress(
         assert "job_id" in response.json()
         mock_scrape.delay.assert_called_once()
         mock_ingress.delay.assert_called_once()
-        assert mock_ingress.delay.call_args.kwargs["depends_on"] is mock_scrape.delay.return_value
+        assert mock_scrape.delay.call_args.args[0] == response.json()["job_id"]
+        dependency = mock_ingress.delay.call_args.kwargs["depends_on"]
+        assert dependency.dependencies == ["scrape-job-id"]
+        assert mock_ingress.delay.call_args.args[0] == response.json()["job_id"]
     finally:
         async def _cleanup() -> None:
             async with db_conn() as conn:
@@ -177,7 +181,7 @@ def test_inflight_job_posting_skips_scrape_reuses_existing_job(
 
     mock_scrape = MagicMock()
     mock_ingress = MagicMock()
-    mock_existing_rq_job = MagicMock()
+    mock_existing_rq_job = "existing-job-id"
     mock_job_cls = MagicMock()
     mock_job_cls.fetch.return_value = mock_existing_rq_job
     monkeypatch.setattr("src.api.scrape_job_details", mock_scrape)
@@ -193,4 +197,6 @@ def test_inflight_job_posting_skips_scrape_reuses_existing_job(
     assert "job_id" in response.json()
     mock_scrape.delay.assert_not_called()
     mock_ingress.delay.assert_called_once()
-    assert mock_ingress.delay.call_args.kwargs["depends_on"] is mock_existing_rq_job
+    dependency = mock_ingress.delay.call_args.kwargs["depends_on"]
+    assert dependency.dependencies == [mock_existing_rq_job]
+    assert mock_ingress.delay.call_args.args[0] == response.json()["job_id"]

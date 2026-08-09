@@ -11,6 +11,7 @@ from rq.job import Dependency, Job
 
 from .deps import (
     get_db_connection,
+    get_authenticated_candidate,
     get_scraper_registry,
     verify_content_hash_header,
 )
@@ -21,7 +22,7 @@ from .jobs import (
     ingress_llm,
     scrape_job_details,
 )
-from .models import Resume
+from .models import Candidate, Resume
 from .schemas import (
     ResumeAnalyzeRequest,
     ResumeUploadRequest,
@@ -58,6 +59,7 @@ async def upload_resume(
     response: Response,
     payload: ResumeUploadRequest,
     content_hash: str = Depends(verify_content_hash_header),
+    candidate: Candidate = Depends(get_authenticated_candidate),
     db_conn=Depends(get_db_connection),
 ):
     resume = Resume(
@@ -71,30 +73,32 @@ async def upload_resume(
                 """
                     INSERT INTO ria.resumes (
                         id,
+                        candidate_id,
                         filename,
                         content_hash,
                         s3_key,
                         created_at,
                         updated_at
                     )
-                    VALUES (%s, %s, %s, %s, NOW(), NOW())
-                    ON CONFLICT (content_hash) DO UPDATE
+                    VALUES (%s, %s, %s, %s, %s, NOW(), NOW())
+                    ON CONFLICT (candidate_id, content_hash) DO UPDATE
                     SET updated_at = NOW()
                     WHERE resumes.processing_status = 'pending'
                     AND (
                             resumes.last_upload_presigned_url_generated_at is NULL
                             OR
-                            resumes.last_upload_presigned_url_generated_at < NOW() - INTERVAL '%s'
+                            resumes.last_upload_presigned_url_generated_at < NOW() - (%s)::interval
                         )
                     RETURNING id, s3_key;
                 """
             ),
             (
                 resume.id,
+                candidate.id,
                 resume.filename,
                 content_hash,
                 resume.s3_key,
-                settings.aws_s3_presigned_url_expiresin
+                f"{settings.aws_s3_presigned_url_expiresin} seconds"
             ),
         )
 
@@ -124,9 +128,10 @@ async def upload_resume(
             UPDATE ria.resumes
             SET last_upload_presigned_url_generated_at = NOW(),
                 updated_at = NOW()
-            WHERE content_hash = %s;
+            WHERE content_hash = %s
+            AND candidate_id = %s;
         """,
-        params=(content_hash,),
+        params=(content_hash, candidate.id),
     )
 
     return ResumeUploadInitResponse(id=resume_id, upload_url=url)
@@ -153,6 +158,7 @@ async def update_resume(
     request: Request,
     response: Response,
     payload: ResumeUploadCompleteRequest,
+    candidate: Candidate = Depends(get_authenticated_candidate),
     db_conn=Depends(get_db_connection),
 ):
     async with db_conn.cursor() as aconn:
@@ -164,17 +170,18 @@ async def update_resume(
                     resumes.processing_status
                 FROM resumes
                 WHERE resumes.id = %s
+                AND resumes.candidate_id = %s
                 AND resumes.processing_status NOT IN ('failed', 'llm_parsed')
                 FOR UPDATE;
             """,
-            (payload.resume_id,),
+            (payload.resume_id, candidate.id),
         )
         resume = await aconn.fetchone()
 
     if resume is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"No resume found for id: {payload.resume_id}",
+            detail="Resume not found",
         )
     
     [resume_id, s3_key, processing_status] = resume
@@ -188,9 +195,10 @@ async def update_resume(
                     UPDATE ria.resumes
                     SET processing_status = 's3_uploaded',
                         updated_at = NOW()
-                    WHERE id = %s;
+                    WHERE id = %s
+                    AND candidate_id = %s;
                 """,
-                params=(payload.resume_id,),
+                params=(payload.resume_id, candidate.id),
             )
         except ClientError as exc:
             error_code = exc.response["Error"]["Code"]
@@ -204,7 +212,7 @@ async def update_resume(
     extract_job = (
         None
         if processing_status == "raw_extracted" 
-        else extract_resume_text.delay(resume_id)  # type: ignore
+        else extract_resume_text.delay(candidate.id, resume_id)  # type: ignore
     )
 
     # On Date: 2026-05-19, cannot think of any feature how parsing the resume
@@ -241,6 +249,7 @@ async def analyze_resume(
     response: Response,
     resume_id: uuid.UUID,
     payload: ResumeAnalyzeRequest,
+    candidate: Candidate = Depends(get_authenticated_candidate),
     db_conn=Depends(get_db_connection),
     scraper_registry=Depends(get_scraper_registry),
 ):
@@ -252,9 +261,10 @@ async def analyze_resume(
                     resumes.raw_text
                 FROM resumes
                 WHERE resumes.id = %s
+                AND resumes.candidate_id = %s
                 AND resumes.raw_text IS NOT NULL;
             """,
-            (resume_id,),
+            (resume_id, candidate.id),
         )
 
         resume = await cur.fetchone()
@@ -262,8 +272,11 @@ async def analyze_resume(
     if resume is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"No resume found with ID {resume_id}.",
+            detail="Resume not found",
         )
+
+    analysis_id = str(uuid.uuid4())
+    settings.redis_conn.set(f"analysis:owner:{analysis_id}", str(candidate.id))
 
     job_scraper = scraper_registry.resolve(payload.job_url)
     normalized_url = job_scraper.normalize(payload.job_url)
@@ -316,7 +329,7 @@ async def analyze_resume(
         )
 
         scrape_job = scrape_job_details.delay(  # type: ignore
-            REQUEST_ID_CTX.get(),
+            analysis_id,
             job_scraper,
             normalized_url,
             url_hash,
@@ -338,7 +351,7 @@ async def analyze_resume(
     )
 
     ingress_llm.delay(  # type: ignore
-        REQUEST_ID_CTX.get(),
+        analysis_id,
         resume.raw_text,
         url_hash,
         depends_on=Dependency(jobs=[scrape_job], allow_failure=True)
@@ -346,7 +359,7 @@ async def analyze_resume(
         else None,
     )
 
-    return {"status": "queued", "job_id": REQUEST_ID_CTX.get()}
+    return {"status": "queued", "job_id": analysis_id}
 
 
 def build_sse_event(data: dict, event_type: str = "message") -> str:
@@ -385,7 +398,17 @@ async def analysis_generator(job_id: str):
 
 
 @router.get("/analysis/{job_id}/stream")
-async def stream_job_analysis(job_id: str):
+async def stream_job_analysis(
+    job_id: str,
+    candidate: Candidate = Depends(get_authenticated_candidate),
+):
+    owner_id = settings.redis_conn.get(f"analysis:owner:{job_id}")
+    if owner_id is None or owner_id.decode() != str(candidate.id):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Analysis not found",
+        )
+
     return StreamingResponse(
         analysis_generator(job_id=job_id),
         media_type="text/event-stream",

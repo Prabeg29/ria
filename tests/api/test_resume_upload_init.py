@@ -54,6 +54,7 @@ def test_upload_rejected_for_invalid_file_size(client: TestClient) -> None:
 
 def test_reupload_rejected_when_presigned_url_recently_generated(
     client: TestClient,
+    candidate_id: str,
 ) -> None:
     """A 'pending' resume whose presigned URL was generated less than 3 minutes
     ago must reject a re-upload with 400 to prevent duplicate uploads."""
@@ -67,6 +68,7 @@ def test_reupload_rejected_when_presigned_url_recently_generated(
                 """
                     INSERT INTO ria.resumes (
                         id,
+                        candidate_id,
                         content_hash,
                         filename,
                         s3_key,
@@ -75,10 +77,11 @@ def test_reupload_rejected_when_presigned_url_recently_generated(
                         created_at,
                         updated_at
                     )
-                    VALUES (%s, %s, %s, %s, 'pending', NOW(), NOW(), NOW());
+                    VALUES (%s, %s, %s, %s, %s, 'pending', NOW(), NOW(), NOW());
                 """,
                 (
                     str(resume_id),
+                    candidate_id,
                     content_hash,
                     "resume.pdf",
                     f"resumes/{resume_id}-resume.pdf",
@@ -175,7 +178,9 @@ def test_upload_init_returns_429_beyond_20_requests_per_minute(
     assert responses[20].status_code == status.HTTP_429_TOO_MANY_REQUESTS
 
 
-def test_presigned_url_is_generated_for_old_content_hash_after_3_mins(client: TestClient) -> None:
+def test_presigned_url_is_generated_for_old_content_hash_after_3_mins(
+    client: TestClient, candidate_id: str
+) -> None:
     content_hash = hashlib.sha256(secrets.token_bytes(32)).hexdigest()
     resume_id = uuid.uuid4()
 
@@ -185,6 +190,7 @@ def test_presigned_url_is_generated_for_old_content_hash_after_3_mins(client: Te
                 """
                     INSERT INTO ria.resumes (
                         id,
+                        candidate_id,
                         content_hash,
                         filename,
                         s3_key,
@@ -193,10 +199,11 @@ def test_presigned_url_is_generated_for_old_content_hash_after_3_mins(client: Te
                         created_at,
                         updated_at
                     )
-                    VALUES (%s, %s, %s, %s, 'pending', NOW() - INTERVAL '4 minutes', NOW(), NOW());
+                    VALUES (%s, %s, %s, %s, %s, 'pending', NOW() - INTERVAL '4 minutes', NOW(), NOW());
                 """,
                 (
                     str(resume_id),
+                    candidate_id,
                     content_hash,
                     "resume.pdf",
                     f"resumes/{resume_id}-resume.pdf",

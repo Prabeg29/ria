@@ -21,6 +21,7 @@ class SeededResume(NamedTuple):
     id: str
     content_hash: str
     s3_key: str
+    candidate_id: str
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -126,7 +127,25 @@ def seed_scraped_job() -> Generator[Callable[..., SeededScrapedJob], None, None]
 
 
 @pytest.fixture
-def seed_resume() -> Generator[Callable[[str, str | None], SeededResume], None, None]:
+def candidate_id(api_key: str) -> str:
+    async def _fetch() -> str:
+        async with db_conn() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT tenant_id FROM ria.api_keys WHERE key_hash = %s;",
+                    (hash_url(api_key),),
+                )
+                row = await cur.fetchone()
+                assert row is not None
+                return str(row[0])
+
+    return asyncio.run(_fetch())
+
+
+@pytest.fixture
+def seed_resume(
+    candidate_id: str,
+) -> Generator[Callable[[str, str | None], SeededResume], None, None]:
     created_ids: list[str] = []
 
     def _create(processing_status: str, raw_text: str | None = None) -> SeededResume:
@@ -140,6 +159,7 @@ def seed_resume() -> Generator[Callable[[str, str | None], SeededResume], None, 
                     """
                         INSERT INTO ria.resumes (
                             id,
+                            candidate_id,
                             content_hash,
                             filename,
                             s3_key,
@@ -149,14 +169,22 @@ def seed_resume() -> Generator[Callable[[str, str | None], SeededResume], None, 
                             created_at,
                             updated_at
                         )
-                        VALUES (%s, %s, %s, %s, %s, %s, NOW(), NOW(), NOW());
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, NOW(), NOW(), NOW());
                     """,
-                    (resume_id, content_hash, "resume.pdf", s3_key, processing_status, raw_text),
+                    (
+                        resume_id,
+                        candidate_id,
+                        content_hash,
+                        "resume.pdf",
+                        s3_key,
+                        processing_status,
+                        raw_text,
+                    ),
                 )
 
         asyncio.run(_seed())
         created_ids.append(resume_id)
-        return SeededResume(resume_id, content_hash, s3_key)
+        return SeededResume(resume_id, content_hash, s3_key, candidate_id)
 
     yield _create
 

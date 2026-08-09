@@ -47,12 +47,26 @@ class BaseModel(TimestampMixin):
 
 
 # ---------------------------
+# Candidate
+# ---------------------------
+@dataclass
+class Candidate(BaseModel):
+    email: str = ""
+
+    @classmethod
+    def table_name(cls) -> str:
+        return "tenants"
+
+
+# ---------------------------
 # Resume
 # ---------------------------
 @dataclass
 class Resume(BaseModel, SoftDeleteMixin):
+    candidate_id: uuid.UUID | None = None
     filename: str = ""
     raw_text: str | None = None
+    processing_status: str = ""
     parsed_data: dict[str, Any] = field(default_factory=dict)
     s3_key: str | None = None
 

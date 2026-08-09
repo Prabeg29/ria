@@ -14,6 +14,7 @@ def resume_pdf_bytes() -> bytes:
     pdf.add_page()
     pdf.set_font("Helvetica", size=11)
     for line in lines:
-        pdf.cell(0, 6, line, new_x="LMARGIN", new_y="NEXT")
+        latin_line = line.encode("latin-1", errors="replace").decode("latin-1")
+        pdf.cell(0, 6, latin_line, new_x="LMARGIN", new_y="NEXT")
 
     return bytes(pdf.output())

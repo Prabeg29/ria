@@ -36,7 +36,9 @@ class Settings:
     aws_secret_key = os.getenv("AWS_SECRET_ACCESS_KEY", "")
     aws_region = os.getenv("AWS_DEFAULT_REGION", "ap-southeast-2")
     aws_bucket = os.getenv("AWS_BUCKET", "")
-    aws_s3_presigned_url_expiresin = os.getenv("AWS_S3_PRESIGNED_URL_EXPIRESIN", "2 minutes")
+    aws_s3_presigned_url_expiresin = int(
+        os.getenv("AWS_S3_PRESIGNED_URL_EXPIRESIN", "120")
+    )
 
     redis_host = os.getenv("REDIS_HOST", "localhost")
     redis_port = int(os.getenv("REDIS_PORT", 6379))

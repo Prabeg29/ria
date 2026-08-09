@@ -143,7 +143,7 @@ def handle_scrape_failure(job, connection, type, value, traceback) -> None:
     retry=retry_with_exponential_backoff(3, initial=30),
     on_failure=handle_retry,
 )
-async def extract_resume_text(resume_id: uuid.UUID) -> None:
+async def extract_resume_text(candidate_id: uuid.UUID, resume_id: uuid.UUID) -> None:
     async with db_conn() as aconn:
         async with aconn.cursor(row_factory=class_row(Resume)) as acur:
             await acur.execute(
@@ -155,11 +155,12 @@ async def extract_resume_text(resume_id: uuid.UUID) -> None:
                         resumes.processing_status
                     FROM resumes
                     WHERE resumes.id = %s
+                        AND resumes.candidate_id = %s
                         AND resumes.processing_status = 's3_uploaded'
                         AND resumes.raw_text IS NULL
                     FOR UPDATE SKIP LOCKED;
                 """,
-                (resume_id,),
+                (resume_id, candidate_id),
             )
             resume = await acur.fetchone()
 
@@ -199,8 +200,9 @@ async def extract_resume_text(resume_id: uuid.UUID) -> None:
                         processing_failure_remarks = %s,
                         updated_at = NOW()
                     WHERE id = %s
+                    AND candidate_id = %s
                 """,
-                (processing_failure_remarks, resume.id,),
+                (processing_failure_remarks, resume.id, candidate_id),
             )
             await aconn.commit()
 
@@ -213,8 +215,9 @@ async def extract_resume_text(resume_id: uuid.UUID) -> None:
                 processing_status = 'raw_extracted',
                 updated_at = NOW()
                 WHERE id = %s
+                AND candidate_id = %s
             """,
-            (raw_text, resume.id,),
+            (raw_text, resume.id, candidate_id),
         )
 
 
