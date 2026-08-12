@@ -50,7 +50,7 @@ router = APIRouter(prefix="")
     'pending' state, or a presigned URL was generated within the last 3 minutes, the request
     is rejected with 400 to prevent duplicate uploads.
 
-    The presigned URL enforces a content-type match and a file size between 50 KB and 1 MB.
+    The presigned URL enforces a content-type match and a file size between 1KB and 10KB.
     It expires after the configured TTL (aws_s3_presigned_url_expiresin).""",
 )
 @rate_limiter.limit("20/minute")
@@ -58,8 +58,8 @@ async def upload_resume(
     request: Request,
     response: Response,
     payload: ResumeUploadRequest,
-    content_hash: str = Depends(verify_content_hash_header),
     candidate: Candidate = Depends(get_authenticated_candidate),
+    content_hash: str = Depends(verify_content_hash_header),
     db_conn=Depends(get_db_connection),
 ):
     resume = Resume(
@@ -118,7 +118,7 @@ async def upload_resume(
         Fields={"Content-Type": payload.content_type},
         Conditions=[
             ["eq", "$Content-Type", payload.content_type],
-            ["content-length-range", 50, 1024 * 1024],
+            ["content-length-range", 1024, 10 * 1024],
         ],
         ExpiresIn=settings.aws_s3_presigned_url_expiresin,
     )
@@ -227,7 +227,7 @@ async def update_resume(
 
 
 @router.post(
-    "/resumes/{resume_id}/analyze",
+    "/resumes/{resume_id}/analyses",
     status_code=status.HTTP_202_ACCEPTED,
     summary="Analyze a resume against a job posting",
     description="""Accepts a job URL, scrapes the posting (or reuses a recent scrape), and queues
@@ -281,6 +281,10 @@ async def analyze_resume(
     job_scraper = scraper_registry.resolve(payload.job_url)
     normalized_url = job_scraper.normalize(payload.job_url)
     url_hash = hash_url(normalized_url)
+
+    # We are hashing the URL but that does not dedup the job posting
+    # The same posting can be on Blackbird as well as OIF
+    # Better we hash the job posting content 
 
     async with db_conn.cursor() as cur:
         await cur.execute(

@@ -10,8 +10,7 @@ END $$;
 
 CREATE TABLE IF NOT EXISTS ria.resumes(
     id UUID NOT NULL,
-    candidate_id UUID NOT NULL,
-    content_hash CHAR(64) NOT NULL,
+    content_hash CHAR(64) UNIQUE NOT NULL,
     filename VARCHAR(255) NOT NULL, 
     raw_text TEXT,
     parsed_data JSON,
@@ -69,10 +68,10 @@ CREATE TABLE IF NOT EXISTS ria.api_keys(
 CREATE INDEX IF NOT EXISTS ix_ria_api_keys_key_hash ON ria.api_keys(key_hash);
 
 ALTER TABLE ria.resumes
-ADD COLUMN IF NOT EXISTS candidate_id UUID;
+DROP CONSTRAINT IF EXISTS resumes_content_hash_key;
 
 ALTER TABLE ria.resumes
-DROP CONSTRAINT IF EXISTS resumes_content_hash_key;
+ADD COLUMN IF NOT EXISTS candidate_id UUID;
 
 DO $$ BEGIN
     ALTER TABLE ria.resumes

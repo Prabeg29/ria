@@ -5,8 +5,8 @@ from pydantic import BaseModel, Field, field_validator
 
 
 VALID_FILE_SIZES = {
-    "min": 50, # 50KB
-    "max": 1024 * 1024, # 1MB
+    "min": 1024, # 1KB
+    "max": 10 * 1024, # 10KB
 }
 
 

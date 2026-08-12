@@ -24,7 +24,9 @@ async def get_authenticated_candidate(
     async with db_conn.cursor() as cur:
         await cur.execute(
             """
-                SELECT tenants.id, tenants.email
+                SELECT
+                    tenants.id,
+                    tenants.email
                 FROM ria.api_keys
                 JOIN ria.tenants ON tenants.id = api_keys.tenant_id
                 WHERE api_keys.key_hash = %s
