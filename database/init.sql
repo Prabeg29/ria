@@ -66,3 +66,27 @@ CREATE TABLE IF NOT EXISTS ria.api_keys(
 );
 
 CREATE INDEX IF NOT EXISTS ix_ria_api_keys_key_hash ON ria.api_keys(key_hash);
+
+ALTER TABLE ria.resumes
+DROP CONSTRAINT IF EXISTS resumes_content_hash_key;
+
+ALTER TABLE ria.resumes
+ADD COLUMN IF NOT EXISTS candidate_id UUID;
+
+DO $$ BEGIN
+    ALTER TABLE ria.resumes
+    ADD CONSTRAINT fk_resumes_candidate
+    FOREIGN KEY (candidate_id) REFERENCES ria.tenants(id) ON DELETE CASCADE;
+EXCEPTION
+    WHEN duplicate_object THEN null;
+END $$;
+
+CREATE INDEX IF NOT EXISTS ix_ria_resumes_candidate_id
+ON ria.resumes(candidate_id);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_ria_resumes_candidate_content_hash
+ON ria.resumes(candidate_id, content_hash);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_ria_legacy_resumes_content_hash
+ON ria.resumes(content_hash)
+WHERE candidate_id IS NULL;

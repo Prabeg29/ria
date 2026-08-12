@@ -21,7 +21,9 @@ def test_resume_must_be_s3_uploaded_for_text_extraction(
     monkeypatch.setattr("src.jobs.s3_client", mock_s3_client)
 
     # Act
-    asyncio.run(extract_resume_text(uuid.UUID(resume.id)))
+    asyncio.run(
+        extract_resume_text(uuid.UUID(resume.candidate_id), uuid.UUID(resume.id))
+    )
 
     # Assert
     mock_s3_client.get_object.assert_not_called()
@@ -61,7 +63,9 @@ def test_empty_resume_after_preprocessing_is_marked_as_failed(
 
     # Act
     with pytest.raises(ValueError):
-        asyncio.run(extract_resume_text(uuid.UUID(resume.id)))
+        asyncio.run(
+            extract_resume_text(uuid.UUID(resume.candidate_id), uuid.UUID(resume.id))
+        )
 
     # Assert
     async def _fetch() -> tuple:
@@ -95,7 +99,9 @@ def test_raw_text_is_extracted_and_status_advances_to_raw_extracted(
     monkeypatch.setattr("src.jobs.s3_client", mock_s3_client)
 
     # Act
-    asyncio.run(extract_resume_text(uuid.UUID(resume.id)))
+    asyncio.run(
+        extract_resume_text(uuid.UUID(resume.candidate_id), uuid.UUID(resume.id))
+    )
 
     # Assert
     mock_s3_client.get_object.assert_called_once_with(

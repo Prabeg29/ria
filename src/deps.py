@@ -2,6 +2,7 @@ from fastapi import Depends, Header, HTTPException, Request, status
 
 from .database import db_conn
 from .job_scraper import ScraperRegistry
+from .models import Candidate
 from .utils import hash_url
 
 
@@ -10,10 +11,10 @@ async def get_db_connection():
         yield conn
 
 
-async def get_api_key(
+async def get_authenticated_candidate(
     x_api_key: str | None = Header(default=None),
     db_conn=Depends(get_db_connection)
-) -> str:
+) -> Candidate:
     if x_api_key is None or x_api_key.strip() is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -23,22 +24,25 @@ async def get_api_key(
     async with db_conn.cursor() as cur:
         await cur.execute(
             """
-                SELECT key_hash
+                SELECT
+                    tenants.id,
+                    tenants.email
                 FROM ria.api_keys
-                WHERE key_hash = %s
+                JOIN ria.tenants ON tenants.id = api_keys.tenant_id
+                WHERE api_keys.key_hash = %s
             """,
             (hash_url(x_api_key),)
         )
 
-        key_hash_db = await cur.fetchone()
+        candidate_row = await cur.fetchone()
     
-    if key_hash_db is None:
+    if candidate_row is None:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Invalid API Key",
         )
     
-    return x_api_key
+    return Candidate(id=candidate_row[0], email=candidate_row[1])
 
 
 def verify_content_hash_header(

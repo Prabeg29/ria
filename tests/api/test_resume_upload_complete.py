@@ -79,7 +79,9 @@ def test_s3_object_is_skipped_for_processing_status_s3_uploaded(
 
     assert response.status_code == status.HTTP_202_ACCEPTED
     mock_s3_client.head_object.assert_not_called()
-    mock_extract_resume_text.delay.assert_called_once_with(uuid.UUID(resume.id))
+    mock_extract_resume_text.delay.assert_called_once_with(
+        uuid.UUID(resume.candidate_id), uuid.UUID(resume.id)
+    )
 
 
 def test_s3_object_is_checked_for_processing_status_pending(
@@ -108,7 +110,9 @@ def test_s3_object_is_checked_for_processing_status_pending(
         Bucket=settings.aws_bucket,
         Key=resume.s3_key,
     )
-    mock_extract_resume_text.delay.assert_called_once_with(uuid.UUID(resume.id))
+    mock_extract_resume_text.delay.assert_called_once_with(
+        uuid.UUID(resume.candidate_id), uuid.UUID(resume.id)
+    )
 
 
 def test_pending_resume_rejected_when_file_not_uploaded_to_s3(

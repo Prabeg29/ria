@@ -11,7 +11,7 @@ from slowapi.errors import RateLimitExceeded
 
 from .api import router
 from .database import init_db
-from .deps import get_api_key, get_db_connection
+from .deps import get_authenticated_candidate, get_db_connection
 from .job_scraper import ScraperRegistry, SeekJobScraper
 from .logger import REQUEST_ID_CTX, logger
 from .settings import settings
@@ -68,7 +68,7 @@ async def add_request_id(request: Request, call_next):
     return response
 
 
-app.include_router(router=router, dependencies=[Depends(get_api_key)])
+app.include_router(router=router, dependencies=[Depends(get_authenticated_candidate)])
 
 
 # --------------------------------------------------

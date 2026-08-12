@@ -3,4 +3,9 @@
 db_data/
 
 __pycache__/
+.pytest_cache
 
+.agents
+.claude
+.scratch
+skills-lock.json
