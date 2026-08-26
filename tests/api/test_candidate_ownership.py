@@ -257,12 +257,12 @@ def test_foreign_resume_is_not_revealed_or_dispatched_for_analysis(
     monkeypatch.setattr("src.api.ingress_llm", ingress_llm)
 
     response = candidate_sessions.client.post(
-        f"/resumes/{resume.id}/analyze",
+        f"/resumes/{resume.id}/analyses",
         headers=candidate_headers(candidate_sessions.second),
         json={"job_url": job_url},
     )
     missing_response = candidate_sessions.client.post(
-        f"/resumes/{uuid.uuid4()}/analyze",
+        f"/resumes/{uuid.uuid4()}/analyses",
         headers=candidate_headers(candidate_sessions.second),
         json={"job_url": job_url},
     )
@@ -340,7 +340,7 @@ def test_client_request_id_cannot_collide_analysis_ownership(
     request_id = str(uuid.uuid4())
 
     first_response = candidate_sessions.client.post(
-        f"/resumes/{first_resume.id}/analyze",
+        f"/resumes/{first_resume.id}/analyses",
         headers={
             **candidate_headers(candidate_sessions.first),
             "X-REQUEST-ID": request_id,
@@ -348,7 +348,7 @@ def test_client_request_id_cannot_collide_analysis_ownership(
         json={"job_url": job_url},
     )
     second_response = candidate_sessions.client.post(
-        f"/resumes/{second_resume.id}/analyze",
+        f"/resumes/{second_resume.id}/analyses",
         headers={
             **candidate_headers(candidate_sessions.second),
             "X-REQUEST-ID": request_id,

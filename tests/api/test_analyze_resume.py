@@ -20,7 +20,7 @@ JOB_URL = "https://www.seek.com.au/job/12345678"
 
 def test_analyze_returns_422_for_unregistered_domain(client: TestClient) -> None:
     response = client.post(
-        f"/resumes/{uuid.uuid4()}/analyze",
+        f"/resumes/{uuid.uuid4()}/analyses",
         json={"job_url": "https://linkedin.com/jobs/12345"},
     )
 
@@ -33,7 +33,7 @@ def test_analyze_returns_404_for_non_existing_resume(client: TestClient) -> None
     non_existing_id = str(uuid.uuid4())
 
     response = client.post(
-        f"/resumes/{non_existing_id}/analyze",
+        f"/resumes/{non_existing_id}/analyses",
         json={"job_url": JOB_URL},
     )
 
@@ -47,7 +47,7 @@ def test_analyze_returns_404_when_raw_text_is_null(
     resume = seed_resume("s3_uploaded")
 
     response = client.post(
-        f"/resumes/{resume.id}/analyze",
+        f"/resumes/{resume.id}/analyses",
         json={"job_url": JOB_URL},
     )
 
@@ -71,7 +71,7 @@ def test_fresh_job_posting_dispatches_scrape_and_ingress(
 
     try:
         response = client.post(
-            f"/resumes/{resume.id}/analyze",
+            f"/resumes/{resume.id}/analyses",
             json={"job_url": job_url},
         )
 
@@ -116,7 +116,7 @@ def test_cached_job_posting_skips_scrape_dispatches_ingress(
     monkeypatch.setattr("src.api.Job", mock_job_cls)
 
     response = client.post(
-        f"/resumes/{resume.id}/analyze",
+        f"/resumes/{resume.id}/analyses",
         json={"job_url": job_url},
     )
 
@@ -152,7 +152,7 @@ def test_analyze_returns_429_beyond_2_requests_per_minute(
     # Act
     responses = [
         client.post(
-            f"/resumes/{resume.id}/analyze",
+            f"/resumes/{resume.id}/analyses",
             json={"job_url": job_url},
         )
         for _ in range(3)
@@ -189,7 +189,7 @@ def test_inflight_job_posting_skips_scrape_reuses_existing_job(
     monkeypatch.setattr("src.api.Job", mock_job_cls)
 
     response = client.post(
-        f"/resumes/{resume.id}/analyze",
+        f"/resumes/{resume.id}/analyses",
         json={"job_url": job_url},
     )
 
